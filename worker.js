@@ -505,12 +505,22 @@ export default {
     const url = new URL(request.url);
 
     // 忽略 favicon 等非根路径请求（浏览器每次访问页面都会自动请求 /favicon.ico，
-    // 若不拦截，会以默认 action=auto 触发一整套签到流程并写入多余日志）
+    // 若不拦截，会触发多余执行并写入多余日志；同时也能挡掉大部分扫描器的路径探测）
     if (url.pathname !== "/") {
       return new Response("Not Found", { status: 404 });
     }
 
-    const action = (url.searchParams.get("action") || "auto").toLowerCase();
+    // 不带 ?action= 参数的裸访问只返回说明页，不执行任何动作。
+    // （公网域名会被扫描器频繁访问，若默认执行 auto，每次扫描都会
+    //   白跑一遍签到流程并写一条日志）
+    const rawAction = url.searchParams.get("action");
+    if (!rawAction) {
+      return jsonResponse({
+        result: "OK",
+        report: "WorkBuddy 签到 Worker 运行中。请通过 ?action= 参数指定操作：auto（签到+成长中心）/ growth / status / claim / all / log",
+      });
+    }
+    const action = rawAction.toLowerCase();
 
     if (env.WORKER_SECRET) {
       const key = url.searchParams.get("key") || request.headers.get("x-worker-key");
