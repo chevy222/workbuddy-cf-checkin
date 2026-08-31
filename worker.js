@@ -449,6 +449,13 @@ export default {
   // HTTP 触发：GET /?action=auto|growth|status|claim|all|log
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
+
+    // 忽略 favicon 等非根路径请求（浏览器每次访问页面都会自动请求 /favicon.ico，
+    // 若不拦截，会以默认 action=auto 触发一整套签到流程并写入多余日志）
+    if (url.pathname !== "/") {
+      return new Response("Not Found", { status: 404 });
+    }
+
     const action = (url.searchParams.get("action") || "auto").toLowerCase();
 
     if (env.WORKER_SECRET) {
