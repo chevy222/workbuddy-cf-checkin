@@ -177,8 +177,19 @@ Worker 的默认域名是公开的，任何人知道 URL 都能触发签到。�
 | `ALREADY` | 今日已签过（幂等，正常） | 无 |
 | `GROWTH` | growth 动作的正常结果 | 无 |
 | `INACTIVE` | 签到活动未开启 | 无 |
-| `NO_SESSION` | 未配置凭据 / 登录态已失效 | 重新登录 WorkBuddy 桌面端 → 重新复制凭据文件 → 更新 `WORKBUDDY_SESSION` → 重新部署 |
+| `TOKEN_EXPIRED` | 登录令牌已过期（签到大概率已失败） | 重新登录 WorkBuddy 桌面端 → 重新复制凭据文件 → 更新 `WORKBUDDY_SESSION` → 重新部署 |
+| `NO_SESSION` | 未配置凭据 / 登录态已失效 | 同上 |
 | `ERROR` / `UNKNOWN` | 接口返回异常，JSON 里附带原始响应 | 看 `report` 与 `claim_body` 字段定位 |
+
+其余通用字段：
+
+| 字段 | 含义 |
+|---|---|
+| `trigger` | 本次执行来源：`cron` = 定时触发，`http:auto`、`http:status` 等 = 手动访问对应的 action |
+| `token_days_left` | 登录令牌剩余有效天数（每次执行自动从令牌中解析） |
+| `token_expire_at` | 令牌到期日期（如 `2026-10-30`） |
+
+**令牌到期预警**：令牌剩余 7 天以内时，`report` 开头会出现「【令牌 X 天后过期…】」的醒目警告；已过期则 result 变为 `TOKEN_EXPIRED`。看到警告后按 [常见问题排查](#常见问题排查) 中的「令牌过期」一节更新 Secret 即可，建议每 45 天左右主动更新一次。
 
 ## 常见问题排查
 

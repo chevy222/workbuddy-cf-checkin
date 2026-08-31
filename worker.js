@@ -115,7 +115,50 @@ function resolveContext(env) {
   }
   const headers = buildHeaders(session);
   const endpoint = (((session.auth || {}).endpoint) || env.WORKBUDDY_ENDPOINT || DEFAULT_ENDPOINT).replace(/\/+$/, "");
-  return { headers, endpoint };
+  const tokenInfo = inspectToken(session.auth.accessToken);
+  return { headers, endpoint, tokenInfo };
+}
+
+/* ---------- 令牌到期预警 ---------- */
+
+// 解析 JWT payload（不校验签名——签名只对签发方有意义，这里只读 exp 做预警）
+function inspectToken(token) {
+  try {
+    const parts = String(token).split(".");
+    if (parts.length < 2) return null;
+    const payload = JSON.parse(atob(parts[1].replace(/-/g, "+").replace(/_/g, "/")));
+    if (!payload.exp) return null;
+    const msLeft = payload.exp * 1000 - Date.now();
+    if (msLeft <= 0) return { daysLeft: 0, expired: true, expireAt: payload.exp * 1000 };
+    return { daysLeft: Math.floor(msLeft / 86400000), expired: false, expireAt: payload.exp * 1000 };
+  } catch (e) {
+    return null; // 解析失败不影响正常签到
+  }
+}
+
+// 把令牌状态附到输出上；临期/过期时改写 result 并在 report 里给出醒目警告
+function applyTokenWarning(out, tokenInfo) {
+  if (!tokenInfo) return out;
+  const expireDate = new Date(tokenInfo.expireAt).toISOString().slice(0, 10);
+  if (tokenInfo.expired) {
+    return {
+      ...out,
+      token_expired: true,
+      token_expire_at: expireDate,
+      result: "TOKEN_EXPIRED",
+      report: "【令牌已过期】" + out.report + "（请重新登录 WorkBuddy 桌面端并更新 WORKBUDDY_SESSION）",
+    };
+  }
+  if (tokenInfo.daysLeft <= 7) {
+    return {
+      ...out,
+      token_days_left: tokenInfo.daysLeft,
+      token_expire_at: expireDate,
+      report: "【令牌 " + tokenInfo.daysLeft + " 天后过期，" + expireDate + " 到期，请尽快更新 WORKBUDDY_SESSION】" + out.report,
+    };
+  }
+  // 常态：仅附带到期信息，不打扰
+  return { ...out, token_days_left: tokenInfo.daysLeft, token_expire_at: expireDate };
 }
 
 /* ---------- 响应解析工具（与 Python 版一一对应） ---------- */
@@ -366,48 +409,59 @@ async function runAuto(headers, endpoint) {
 
 /* ---------- 动作调度（对应 Python 的 main） ---------- */
 
-async function runAction(env, action) {
+// trigger：执行来源标记，写入日志便于区分（"cron" = 定时触发 / "http:<action>" = 手动访问）
+async function runAction(env, action, trigger) {
   let ctx;
   try {
     ctx = resolveContext(env);
   } catch (e) {
-    return { code: 1, out: { result: "NO_SESSION", report: String(e.message || e) } };
+    return { code: 1, out: { trigger: trigger, result: "NO_SESSION", report: String(e.message || e) } };
   }
-  const { headers, endpoint } = ctx;
+  const { headers, endpoint, tokenInfo } = ctx;
 
+  let r;
   switch (action) {
     case "auto": {
-      const r = await runAuto(headers, endpoint);
+      r = await runAuto(headers, endpoint);
       // 签到后顺带跑成长中心
       const g = await runGrowth(headers, endpoint);
       r.out.growth = g.out.report;
       if (g.out.credits_gained) r.out.report += "；" + g.out.report;
-      return r;
+      break;
     }
     case "growth":
-      return runGrowth(headers, endpoint);
+      r = await runGrowth(headers, endpoint);
+      break;
     case "status": {
       const s = await post(endpoint + "/v2/billing/meter/checkin-activity-status", headers);
-      return { code: 0, out: { step: "status", http: s.status, body: s.body } };
+      r = { code: 0, out: { step: "status", http: s.status, body: s.body } };
+      break;
     }
     case "claim": {
       const c = await post(endpoint + "/v2/billing/meter/daily-checkin", headers);
-      return { code: 0, out: { step: "claim", http: c.status, body: c.body } };
+      r = { code: 0, out: { step: "claim", http: c.status, body: c.body } };
+      break;
     }
     case "all": {
       const s = await post(endpoint + "/v2/billing/meter/checkin-activity-status", headers);
       const c = await post(endpoint + "/v2/billing/meter/daily-checkin", headers);
-      return {
+      r = {
         code: 0,
         out: {
           status: { http: s.status, body: s.body },
           claim: { http: c.status, body: c.body },
         },
       };
+      break;
     }
     default:
-      return { code: 2, out: { result: "BAD_ACTION", report: "未知 action：" + action + "（可选 auto/growth/status/claim/all/log）" } };
+      return { code: 2, out: { trigger: trigger, result: "BAD_ACTION", report: "未知 action：" + action + "（可选 auto/growth/status/claim/all/log）" } };
   }
+
+  // 附上执行来源与令牌到期预警
+  r.out.trigger = trigger;
+  r.out = applyTokenWarning(r.out, tokenInfo);
+  return r;
 }
 
 async function saveLog(env, out) {
@@ -441,7 +495,7 @@ function jsonResponse(obj, status = 200) {
 export default {
   // 定时任务：每天自动签到 + 成长中心（对应 Python 的 auto 模式 + 计划任务）
   async scheduled(event, env, ctx) {
-    const result = await runAction(env, "auto");
+    const result = await runAction(env, "auto", "cron");
     console.log("[workbuddy-signin] " + JSON.stringify(result.out, null, 2));
     await saveLog(env, result.out);
   },
@@ -478,7 +532,7 @@ export default {
       return jsonResponse({ result: "LOG", count: history.length, history: history });
     }
 
-    const result = await runAction(env, action);
+    const result = await runAction(env, action, "http:" + action);
     await saveLog(env, result.out);
     return jsonResponse(result.out, result.code === 0 ? 200 : 500);
   },
