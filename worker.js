@@ -466,7 +466,12 @@ async function runAction(env, action, trigger) {
 
 async function saveLog(env, out) {
   if (!env.KV) return;
-  const entry = { time: new Date().toISOString(), ...out };
+  // 北京时间（UTC+8），格式 yyyy-MM-dd HH:mm:ss，如 2026-09-01 08:00:42
+  const d = new Date(Date.now() + 8 * 3600 * 1000);
+  const p = (n) => String(n).padStart(2, "0");
+  const time = d.getUTCFullYear() + "-" + p(d.getUTCMonth() + 1) + "-" + p(d.getUTCDate()) +
+    " " + p(d.getUTCHours()) + ":" + p(d.getUTCMinutes()) + ":" + p(d.getUTCSeconds());
+  const entry = { time: time, ...out };
   try {
     await env.KV.put("signin:last", JSON.stringify(entry));
     let history = [];
