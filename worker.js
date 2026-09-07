@@ -743,7 +743,9 @@ function pageShell(title, inner, autoRefresh) {
     '<meta name="viewport" content="width=device-width,initial-scale=1">' +
     (autoRefresh ? '<meta http-equiv="refresh" content="60">' : "") +
     "<title>" + escapeHtml(title) + "</title><style>" + PAGE_CSS + "</style></head>" +
-    '<body><div class="wrap">' + inner + '</div></body></html>';
+    '<body><div class="wrap">' + inner +
+    '<footer style="text-align:center;margin-top:18px;font-size:12px;color:#8A919C;">Powered by <a href="https://github.com/chevy222/workbuddy-cf-checkin" target="_blank" rel="noopener">Github</a></footer>' +
+    '</div></body></html>';
 }
 
 // 内部链接：动作走 URL 路径（与 trae 版一致），访问密钥等仍走查询串。
