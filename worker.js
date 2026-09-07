@@ -13,18 +13,32 @@
  *   - 登录失效 : HTTP 401/403，需重新登录桌面端
  *
  * 凭据（Workers 无法读取本机文件，改用 Worker 的环境变量 / Secret）：
- *   WORKBUDDY_SESSION        workbuddy-desktop.info 的完整 JSON 内容（推荐）
- *   WORKBUDDY_TOKEN          accessToken（与 WORKBUDDY_UID 搭配，作为简化替代）
- *   WORKBUDDY_UID            账号 uid
- *   WORKBUDDY_ENTERPRISE_ID  可选，企业 ID
- *   WORKBUDDY_DOMAIN         可选
- *   WORKBUDDY_ENDPOINT       可选，默认 https://copilot.tencent.com
- *   WORKER_SECRET            可选；设置后需以 ?key=xxx 或请求头 X-Worker-Key 访问
- *   KV 绑定（变量名 KV）      可选；保存最近 30 次运行记录，?action=log 查看
+ *   WORKBUDDY_ACCOUNTS     多账号（推荐）：JSON 数组，每项形如
+ *                          [
+ *                            {"name":"主号","session":{ workbuddy-desktop.info 的完整 JSON 对象 }},
+ *                            {"name":"小号","token":"accessToken","uid":"uid",
+ *                             "enterpriseId":"可选","domain":"可选","endpoint":"可选"}
+ *                          ]
+ *                          其中 session 也允许是整段 JSON 字符串；name 缺省取账号昵称或"账号N"。
+ *   WORKBUDDY_SESSION      单账号：workbuddy-desktop.info 的完整 JSON 内容（兼容旧配置）
+ *   WORKBUDDY_TOKEN + WORKBUDDY_UID   单账号简化替代
+ *   WORKBUDDY_ENTERPRISE_ID / WORKBUDDY_DOMAIN / WORKBUDDY_ENDPOINT  单账号可选项
+ *   WORKER_SECRET          可选；设置后需以 ?key=xxx 或请求头 X-Worker-Key 访问
+ *   KV 绑定（变量名 KV）    可选；保存最近 30 次运行记录，?action=log 查看
+ *
+ * 多账号：
+ *   - Cron 触发时依次执行全部账号的 auto（签到 + 成长中心），结果聚合为一条运行记录；
+ *   - 手动访问可加 &account=账号名 只执行其中一个账号；
+ *   - 单账号配置的 JSON 输出与旧版完全一致（仅多一个 account 字段）。
+ *
+ * 页面 / 输出：
+ *   - 浏览器直接访问（Accept: text/html）返回可视化 HTML 页面：日志表格、详情、执行结果；
+ *   - 加 ?format=json（或 &raw=1）强制返回 JSON，curl / 程序调用默认也是 JSON；
+ *   - 日志列表页每 60 秒自动刷新；?action=log&i=N 查看第 N 条记录详情。
  *
  * 用法（全部在 Cloudflare 控制台完成，无需 wrangler）：
  *   - 部署：创建 Worker → 把本文件全部代码粘贴进编辑器 → 部署
- *   - 配置凭据：该 Worker 的 设置 → 变量和机密 → 添加 Secret（如 WORKBUDDY_SESSION）
+ *   - 配置凭据：该 Worker 的 设置 → 变量和机密 → 添加 Secret
  *   - 定时触发：该 Worker 的 设置 → 触发事件 → Cron 触发器 → 添加如 30 1 * * *
  *     （注意 Cron 按 UTC 计算，30 1 * * * = 北京时间每天 09:30），自动执行 auto（签到 + 成长中心）
  *   - 手动触发：浏览器访问 https://<worker域名>/?action=auto|growth|status|claim|all|log
@@ -66,7 +80,7 @@ function get(url, headers) {
   return request(url, headers, "GET");
 }
 
-/* ---------- 凭据（对应 Python 的 find_auth_file/load_session/build_headers） ---------- */
+/* ---------- 凭据：单账号头部构建 / 多账号解析 ---------- */
 
 function buildHeaders(session) {
   const auth = (session && session.auth) || {};
@@ -91,32 +105,105 @@ function buildHeaders(session) {
   return headers;
 }
 
-function resolveContext(env) {
+// 解析 WORKBUDDY_ACCOUNTS 数组中的一项，返回可直接执行的账号上下文
+function buildAccount(conf, index, env) {
+  if (!conf || typeof conf !== "object") throw new Error("第 " + (index + 1) + " 项不是 JSON 对象");
+
   let session = null;
-  if (env.WORKBUDDY_SESSION) {
-    try {
-      session = JSON.parse(env.WORKBUDDY_SESSION);
-    } catch (e) {
-      throw new Error("NO_SESSION: WORKBUDDY_SESSION 不是合法 JSON");
-    }
-  } else if (env.WORKBUDDY_TOKEN && env.WORKBUDDY_UID) {
+  if (conf.session !== undefined && conf.session !== null && conf.session !== "") {
+    // 形态一：{"name":"主号","session":{...整段 info JSON...}}（session 也允许是 JSON 字符串）
+    session = typeof conf.session === "string" ? JSON.parse(conf.session) : conf.session;
+  } else if (conf.auth && conf.account) {
+    // 容错：数组元素本身就是一段 info JSON
+    session = conf;
+  } else if (conf.token && conf.uid) {
+    // 形态二：{"name":"小号","token":"...","uid":"..."}
     session = {
-      auth: { accessToken: env.WORKBUDDY_TOKEN },
-      account: { uid: env.WORKBUDDY_UID },
+      auth: { accessToken: conf.token },
+      account: { uid: String(conf.uid) },
     };
-    if (env.WORKBUDDY_ENTERPRISE_ID) session.account.enterpriseId = env.WORKBUDDY_ENTERPRISE_ID;
-    if (env.WORKBUDDY_DOMAIN) session.auth.domain = env.WORKBUDDY_DOMAIN;
+    if (conf.enterpriseId) session.account.enterpriseId = conf.enterpriseId;
+    if (conf.domain) session.auth.domain = conf.domain;
+  } else {
+    throw new Error("缺少 session（整段凭据 JSON）或 token+uid");
   }
-  if (!session) {
-    throw new Error(
-      "NO_SESSION: 未配置登录凭据。请在 Worker 的 设置 → 变量和机密 中添加 Secret 变量 WORKBUDDY_SESSION" +
-      "（值为 workbuddy-desktop.info 的完整 JSON 内容）；或分别添加 WORKBUDDY_TOKEN 与 WORKBUDDY_UID。"
-    );
-  }
-  const headers = buildHeaders(session);
-  const endpoint = (((session.auth || {}).endpoint) || env.WORKBUDDY_ENDPOINT || DEFAULT_ENDPOINT).replace(/\/+$/, "");
+
+  const headers = buildHeaders(session); // 缺 token/uid 时在此抛错
+  const endpoint = ((((session.auth || {}).endpoint)) || conf.endpoint || env.WORKBUDDY_ENDPOINT || DEFAULT_ENDPOINT).replace(/\/+$/, "");
   const tokenInfo = inspectToken(session.auth.accessToken);
-  return { headers, endpoint, tokenInfo };
+  const acc = (session.account || {});
+  const fallbackName = acc.nickname || acc.name || ("账号" + (index + 1));
+  return { name: conf.name ? String(conf.name) : String(fallbackName), headers, endpoint, tokenInfo };
+}
+
+// 解析出本次要执行的账号列表；配置非法时抛错，单个账号非法时该账号带 error 字段，不影响其他账号
+function resolveAccounts(env, filterName) {
+  const accounts = [];
+
+  if (env.WORKBUDDY_ACCOUNTS) {
+    let arr;
+    try {
+      arr = JSON.parse(env.WORKBUDDY_ACCOUNTS);
+    } catch (e) {
+      throw new Error("NO_SESSION: WORKBUDDY_ACCOUNTS 不是合法 JSON（需为数组，每项含 name 与 session 或 token+uid）");
+    }
+    if (!Array.isArray(arr) || !arr.length) {
+      throw new Error("NO_SESSION: WORKBUDDY_ACCOUNTS 必须是非空 JSON 数组");
+    }
+    arr.forEach((conf, i) => {
+      try {
+        accounts.push(buildAccount(conf, i, env));
+      } catch (e) {
+        accounts.push({ name: (conf && conf.name) || ("账号" + (i + 1)), error: String(e.message || e) });
+      }
+    });
+  } else {
+    // 向后兼容：单账号环境变量
+    let session = null;
+    if (env.WORKBUDDY_SESSION) {
+      try {
+        session = JSON.parse(env.WORKBUDDY_SESSION);
+      } catch (e) {
+        throw new Error("NO_SESSION: WORKBUDDY_SESSION 不是合法 JSON");
+      }
+    } else if (env.WORKBUDDY_TOKEN && env.WORKBUDDY_UID) {
+      session = {
+        auth: { accessToken: env.WORKBUDDY_TOKEN },
+        account: { uid: env.WORKBUDDY_UID },
+      };
+      if (env.WORKBUDDY_ENTERPRISE_ID) session.account.enterpriseId = env.WORKBUDDY_ENTERPRISE_ID;
+      if (env.WORKBUDDY_DOMAIN) session.auth.domain = env.WORKBUDDY_DOMAIN;
+    }
+    if (!session) {
+      throw new Error(
+        "NO_SESSION: 未配置登录凭据。请在 Worker 的 设置 → 变量和机密 中添加 Secret：" +
+        "多账号用 WORKBUDDY_ACCOUNTS（JSON 数组）；单账号用 WORKBUDDY_SESSION（workbuddy-desktop.info 完整 JSON），" +
+        "或分别添加 WORKBUDDY_TOKEN 与 WORKBUDDY_UID。"
+      );
+    }
+    accounts.push(buildAccount({ name: "default", session: session }, 0, env));
+  }
+
+  // 重名自动加序号
+  const nameCount = {};
+  for (const a of accounts) {
+    if (nameCount[a.name]) {
+      nameCount[a.name] += 1;
+      a.name = a.name + "(" + nameCount[a.name] + ")";
+    } else {
+      nameCount[a.name] = 1;
+    }
+  }
+
+  // ?account=名字：只执行指定账号
+  if (filterName) {
+    const hit = accounts.filter((a) => a.name === filterName);
+    if (!hit.length) {
+      throw new Error("NO_SESSION: 找不到名为「" + filterName + "」的账号；当前已配置：" + accounts.map((a) => a.name).join("、"));
+    }
+    return hit;
+  }
+  return accounts;
 }
 
 /* ---------- 令牌到期预警 ---------- */
@@ -146,7 +233,7 @@ function applyTokenWarning(out, tokenInfo) {
       token_expired: true,
       token_expire_at: expireDate,
       result: "TOKEN_EXPIRED",
-      report: "【令牌已过期】" + out.report + "（请重新登录 WorkBuddy 桌面端并更新 WORKBUDDY_SESSION）",
+      report: "【令牌已过期】" + out.report + "（请更新该账号的凭据 Secret）",
     };
   }
   if (tokenInfo.daysLeft <= 7) {
@@ -154,7 +241,7 @@ function applyTokenWarning(out, tokenInfo) {
       ...out,
       token_days_left: tokenInfo.daysLeft,
       token_expire_at: expireDate,
-      report: "【令牌 " + tokenInfo.daysLeft + " 天后过期，" + expireDate + " 到期，请尽快更新 WORKBUDDY_SESSION】" + out.report,
+      report: "【令牌 " + tokenInfo.daysLeft + " 天后过期，" + expireDate + " 到期，请尽快更新凭据】" + out.report,
     };
   }
   // 常态：仅附带到期信息，不打扰
@@ -407,26 +494,27 @@ async function runAuto(headers, endpoint) {
   };
 }
 
-/* ---------- 动作调度（对应 Python 的 main） ---------- */
+/* ---------- 动作调度：单账号执行 + 多账号聚合 ---------- */
 
 // trigger：执行来源标记，写入日志便于区分（"cron" = 定时触发 / "http:<action>" = 手动访问）
-async function runAction(env, action, trigger) {
-  let ctx;
-  try {
-    ctx = resolveContext(env);
-  } catch (e) {
-    return { code: 1, out: { trigger: trigger, result: "NO_SESSION", report: String(e.message || e) } };
+async function runOne(account, action, trigger) {
+  // 该账号自身配置非法（如 JSON 残缺、缺 token），直接返回失败、不发任何请求
+  if (account.error) {
+    return { code: 1, out: { account: account.name, trigger: trigger, result: "NO_SESSION", report: "账号配置无效：" + account.error } };
   }
-  const { headers, endpoint, tokenInfo } = ctx;
+  const { headers, endpoint, tokenInfo } = account;
 
   let r;
   switch (action) {
     case "auto": {
       r = await runAuto(headers, endpoint);
-      // 签到后顺带跑成长中心
-      const g = await runGrowth(headers, endpoint);
-      r.out.growth = g.out.report;
-      if (g.out.credits_gained) r.out.report += "；" + g.out.report;
+      // 仅当签到链路正常（CLAIMED / ALREADY / INACTIVE，code===0）时才顺带跑成长中心；
+      // 登录失效或接口异常（code!==0）时直接返回，避免用失效登录态白打一串成长中心请求
+      if (r.code === 0) {
+        const g = await runGrowth(headers, endpoint);
+        r.out.growth = g.out.report;
+        if (g.out.credits_gained) r.out.report += "；" + g.out.report;
+      }
       break;
     }
     case "growth":
@@ -455,14 +543,60 @@ async function runAction(env, action, trigger) {
       break;
     }
     default:
-      return { code: 2, out: { trigger: trigger, result: "BAD_ACTION", report: "未知 action：" + action + "（可选 auto/growth/status/claim/all/log）" } };
+      return { code: 2, out: { account: account.name, trigger: trigger, result: "BAD_ACTION", report: "未知 action：" + action + "（可选 auto/growth/status/claim/all/log）" } };
   }
 
-  // 附上执行来源与令牌到期预警
+  // 附上账号名、执行来源与令牌到期预警
+  r.out.account = account.name;
   r.out.trigger = trigger;
   r.out = applyTokenWarning(r.out, tokenInfo);
   return r;
 }
+
+const GOOD_RESULTS = new Set(["CLAIMED", "ALREADY", "INACTIVE", "GROWTH", "OK"]);
+
+function aggregateResult(outs) {
+  const results = outs.map((o) => o.result);
+  const bad = results.filter((x) => !GOOD_RESULTS.has(x));
+  if (!bad.length) {
+    if (results.every((x) => x === results[0])) return results[0];
+    if (results.includes("CLAIMED")) return "CLAIMED"; // 有账号领到积分即算领取成功
+    return "OK";
+  }
+  if (bad.length === results.length && results.every((x) => x === results[0])) return results[0];
+  return bad.length === results.length ? "FAILED" : "PARTIAL_FAILED";
+}
+
+// 多账号依次执行并聚合；单账号输出保持平铺（与旧版 JSON 形态兼容）
+async function runAction(env, action, trigger, filterName) {
+  let accounts;
+  try {
+    accounts = resolveAccounts(env, filterName);
+  } catch (e) {
+    return { code: 1, out: { trigger: trigger, result: "NO_SESSION", report: String(e.message || e) } };
+  }
+
+  const results = [];
+  for (const acc of accounts) {
+    results.push(await runOne(acc, action, trigger));
+  }
+
+  if (results.length === 1) return results[0];
+
+  const outs = results.map((r) => r.out);
+  const code = results.some((r) => r.code !== 0) ? 1 : 0;
+  return {
+    code: code,
+    out: {
+      result: aggregateResult(outs),
+      report: outs.map((o) => "[" + (o.account || "默认") + "] " + (o.report || "")).join("；"),
+      accounts: outs,
+      trigger: trigger,
+    },
+  };
+}
+
+/* ---------- KV 运行日志 ---------- */
 
 async function saveLog(env, out) {
   if (!env.KV) return;
@@ -488,6 +622,17 @@ async function saveLog(env, out) {
   }
 }
 
+async function loadHistory(env) {
+  if (!env.KV) return [];
+  try {
+    return JSON.parse((await env.KV.get("signin:history")) || "[]");
+  } catch (e) {
+    return [];
+  }
+}
+
+/* ---------- JSON / HTML 响应 ---------- */
+
 function jsonResponse(obj, status = 200) {
   return new Response(JSON.stringify(obj, null, 2), {
     status: status,
@@ -495,60 +640,350 @@ function jsonResponse(obj, status = 200) {
   });
 }
 
+function htmlResponse(html, status = 200) {
+  return new Response(html, {
+    status: status,
+    headers: { "Content-Type": "text/html; charset=utf-8" },
+  });
+}
+
+function escapeHtml(v) {
+  return String(v == null ? "" : v).replace(/[&<>"']/g, (c) => ({
+    "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;",
+  }[c]));
+}
+
+function truncate(s, n) {
+  s = String(s == null ? "" : s).replace(/\s+/g, " ");
+  return s.length > n ? s.slice(0, n) + "…" : s;
+}
+
+function triggerLabel(t) {
+  if (!t) return "-";
+  if (t === "cron") return "定时触发";
+  if (t.indexOf("http:") === 0) return "手动 · " + t.slice(5);
+  return t;
+}
+
+// result → 中文徽章文案与样式类
+const RESULT_META = {
+  CLAIMED: ["已领取", "claimed"],
+  ALREADY: ["已签到", "already"],
+  GROWTH: ["成长中心", "growth"],
+  INACTIVE: ["活动未开", "inactive"],
+  TOKEN_EXPIRED: ["令牌过期", "token_expired"],
+  NO_SESSION: ["登录失效", "no_session"],
+  ERROR: ["错误", "error"],
+  UNKNOWN: ["未知", "unknown"],
+  PARTIAL_FAILED: ["部分失败", "partial_failed"],
+  FAILED: ["失败", "failed"],
+  OK: ["正常", "ok"],
+};
+
+function badgeFor(out) {
+  const r = (out && out.result) || "";
+  if (!r && out && out.step) return { label: "调试 · " + out.step, cls: "debug" };
+  const m = RESULT_META[r];
+  return m ? { label: m[0], cls: m[1] } : { label: r || "-", cls: "inactive" };
+}
+
+function badgeHtml(out) {
+  const b = badgeFor(out);
+  return '<span class="badge b-' + b.cls + '">' + escapeHtml(b.label) + "</span>";
+}
+
+const PAGE_CSS = `
+*{box-sizing:border-box;}
+body{margin:0;background:#F4F3EE;color:#1A1B1C;font-family:'PingFang SC','Segoe UI','Microsoft YaHei',Arial,sans-serif;line-height:1.6;font-size:13.5px;}
+.wrap{max-width:920px;margin:0 auto;padding:20px 14px 40px;}
+.hd{display:flex;justify-content:space-between;align-items:baseline;flex-wrap:wrap;gap:8px;}
+h2{font-size:17px;margin:0;font-weight:600;}
+h3{font-size:14px;margin:16px 0 6px;}
+.sub{font-size:12px;color:#6B7280;}
+hr{border:none;border-top:1px solid #E4E3DD;margin:12px 0;}
+a{color:#2E7E96;text-decoration:none;} a:hover{text-decoration:underline;}
+.toolbar{display:flex;gap:16px;flex-wrap:wrap;margin:10px 0;font-size:13px;}
+.tbl-scroll{overflow-x:auto;}
+table{width:100%;border-collapse:collapse;background:#fff;border:1px solid #E4E3DD;border-radius:12px;overflow:hidden;}
+th{text-align:left;background:rgba(163,213,232,.18);font-size:12px;color:#374151;padding:8px 10px;font-weight:600;white-space:nowrap;}
+td{padding:8px 10px;font-size:13px;border-top:1px solid #F0EFEA;vertical-align:top;}
+.badge{display:inline-block;padding:2px 9px;border-radius:10px;font-size:12px;white-space:nowrap;}
+.b-claimed{background:rgba(82,196,26,.14);color:#2F6B12;}
+.b-already,.b-growth,.b-ok,.b-debug{background:rgba(139,200,234,.22);color:#25607A;}
+.b-inactive{background:rgba(0,0,0,.06);color:#6B7280;}
+.b-no_session,.b-token_expired{background:rgba(234,102,104,.14);color:#B03A3C;}
+.b-error,.b-unknown,.b-partial_failed,.b-failed{background:rgba(250,173,20,.20);color:#8A5A00;}
+.card{background:#fff;border:1px solid #E4E3DD;border-radius:12px;padding:12px 14px;margin:10px 0;}
+.cardhd{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-bottom:4px;}
+.accname{font-weight:600;font-size:14px;}
+.report{font-size:13.5px;color:#1F2937;word-break:break-word;}
+.meta{font-size:12px;color:#6B7280;margin-top:5px;word-break:break-word;}
+pre{white-space:pre-wrap;word-break:break-all;background:#fff;border:1px solid #E4E3DD;border-radius:12px;padding:14px;font-size:12.5px;line-height:1.6;}
+details{margin-top:8px;} summary{cursor:pointer;color:#6B7280;font-size:12.5px;}
+.btnrow a{display:inline-block;padding:6px 14px;border:1px solid #CFDADF;background:#fff;border-radius:999px;font-size:13px;margin:0 8px 8px 0;}
+.warn{border-color:rgba(234,102,104,.45);}
+`;
+
+function pageShell(title, inner, autoRefresh) {
+  return "<!doctype html><html lang=\"zh-CN\"><head><meta charset=\"utf-8\">" +
+    '<meta name="viewport" content="width=device-width,initial-scale=1">' +
+    (autoRefresh ? '<meta http-equiv="refresh" content="60">' : "") +
+    "<title>" + escapeHtml(title) + "</title><style>" + PAGE_CSS + "</style></head>" +
+    '<body><div class="wrap">' + inner + '</div></body></html>';
+}
+
+// 内部链接（透传访问密钥）
+function link(action, keyQ) {
+  return "/?action=" + action + (keyQ || "");
+}
+
+function debugBrief(o) {
+  if (!o) return "";
+  if (o.step) return "[" + o.step + "] HTTP " + o.http;
+  if (o.status && o.claim) return "[all] status HTTP " + o.status.http + " / claim HTTP " + o.claim.http;
+  return "";
+}
+
+// 单账号兼容配置的内部名 default 不直接展示给用户
+function displayName(n) {
+  return n && n !== "default" ? n : "默认账号";
+}
+
+function accountCard(a) {
+  const meta = [];
+  if (a.credit != null) meta.push("本次 " + a.credit + " 积分");
+  if (a.streak_days != null) meta.push("连续 " + a.streak_days + " 天");
+  if (a.total_credits != null) meta.push("累计 " + a.total_credits + " 积分");
+  if (a.energy != null) meta.push("能量 " + a.energy);
+  if (a.credits_gained != null && a.credits_gained) meta.push("成长中心 +" + a.credits_gained + " 积分");
+  if (a.token_days_left != null) meta.push("令牌剩 " + a.token_days_left + " 天（" + a.token_expire_at + " 到期）");
+  if (a.token_expired) meta.push("令牌已过期（" + a.token_expire_at + "）");
+
+  // 单账号（内部名 default）不重复显示账号名
+  const nameHtml = (a.account && a.account !== "default")
+    ? '<span class="accname">' + escapeHtml(a.account) + "</span>"
+    : "";
+  let html = '<div class="card"><div class="cardhd">' +
+    nameHtml + badgeHtml(a) +
+    (a.http != null ? '<span class="sub">HTTP ' + a.http + "</span>" : "") +
+    '</div><div class="report">' + escapeHtml(a.report || debugBrief(a) || "-") + "</div>";
+  if (a.growth) html += '<div class="meta">成长中心：' + escapeHtml(a.growth) + "</div>";
+  if (meta.length) html += '<div class="meta">' + meta.map(escapeHtml).join(" · ") + "</div>";
+  if (a.step || (a.status && a.claim)) {
+    html += "<details><summary>查看接口原始返回</summary><pre>" + escapeHtml(JSON.stringify(a.step ? a.body : { status: a.status, claim: a.claim }, null, 2)) + "</pre></details>";
+  }
+  return html + "</div>";
+}
+
+// 日志列表页（仿 trae /logs：表格 + 徽章，60 秒自动刷新）
+function renderLogList(history, keyQ) {
+  let rows = "";
+  if (!history.length) {
+    rows = '<tr><td colspan="5" class="sub" style="padding:18px 10px;">暂无运行记录，点上方「立即签到」执行一次后即可看到。</td></tr>';
+  } else {
+    history.forEach((e, idx) => {
+      const multi = Array.isArray(e.accounts) && e.accounts.length;
+      const lines = multi ? e.accounts : [e];
+      lines.forEach((o, j) => {
+        const b = badgeFor(o);
+        const note = o.report || debugBrief(o) || "";
+        let row = "<tr>";
+        if (j === 0) {
+          row += '<td rowspan="' + lines.length + '" style="white-space:nowrap;color:#6B7280;font-size:12px;">' +
+            escapeHtml(e.time) + "<br>" + escapeHtml(triggerLabel(e.trigger)) + "</td>";
+        }
+        row += '<td><span class="badge b-' + b.cls + '">' + escapeHtml(b.label) + "</span></td>";
+        const accLabel = o.account && o.account !== "default" ? o.account : "—";
+        row += '<td style="white-space:nowrap;">' + escapeHtml(accLabel) + "</td>";
+        row += '<td style="color:#374151;">' + escapeHtml(truncate(note, 120)) + "</td>";
+        if (j === 0) {
+          row += '<td rowspan="' + lines.length + '" style="white-space:nowrap;"><a href="/?action=log&i=' + idx + keyQ + '">详情</a></td>';
+        }
+        row += "</tr>";
+        rows += row;
+      });
+    });
+  }
+
+  const inner =
+    '<div class="hd"><h2>WorkBuddy 签到运行日志</h2>' +
+    '<span class="sub">最近 ' + history.length + ' 条运行记录 · 每 60 秒自动刷新 · 仅保留最近 30 次</span></div>' +
+    '<div class="toolbar">' +
+      '<a href="' + link("auto", keyQ) + '">▶ 立即签到 (auto)</a>' +
+      '<a href="' + link("growth", keyQ) + '">成长中心</a>' +
+      '<a href="' + link("status", keyQ) + '">查状态</a>' +
+      '<a href="' + link("log", keyQ) + '">刷新</a>' +
+      '<a href="' + link("log", keyQ) + '&format=json">原始 JSON</a>' +
+    "</div>" +
+    '<div class="tbl-scroll"><table><thead><tr>' +
+    "<th>时间(北京)</th><th>结果</th><th>账号</th><th>说明</th><th></th>" +
+    "</tr></thead><tbody>" + rows + "</tbody></table></div>";
+  return pageShell("WorkBuddy 签到日志", inner, true);
+}
+
+// 日志详情页
+function renderDetail(history, i, keyQ) {
+  const e = history[i];
+  let inner = '<p><a href="' + link("log", keyQ) + '">← 返回日志列表</a></p>';
+  if (!e) {
+    inner += '<div class="card sub">记录不存在（可能已被新记录挤出，仅保留最近 30 次运行）。</div>';
+  } else {
+    inner += '<div class="card"><b>' + escapeHtml(e.time) + "</b> &nbsp;<span class=\"sub\">" + escapeHtml(triggerLabel(e.trigger)) + "</span></div>" +
+      "<pre>" + escapeHtml(JSON.stringify(e, null, 2)) + "</pre>";
+  }
+  return pageShell("日志详情", inner, false);
+}
+
+// 动作执行结果页
+function renderResult(out, action, keyQ) {
+  const actionName = { auto: "每日签到（auto）", growth: "成长中心", status: "查询签到状态", claim: "领取签到", all: "状态 + 领取" }[action] || action;
+  let body = "";
+  if (Array.isArray(out.accounts) && out.accounts.length > 1) {
+    body += '<div class="card"><div class="cardhd"><span class="accname">汇总</span>' + badgeHtml(out) + "</div>" +
+      '<div class="report">' + escapeHtml(out.report || "") + "</div></div>";
+    body += out.accounts.map(accountCard).join("");
+  } else {
+    const one = (Array.isArray(out.accounts) && out.accounts[0]) || out;
+    body += accountCard(one);
+  }
+  body += "<details><summary>查看本次完整 JSON</summary><pre>" + escapeHtml(JSON.stringify(out, null, 2)) + "</pre></details>";
+
+  const inner =
+    '<div class="hd"><h2>执行结果 · ' + escapeHtml(actionName) + "</h2>" +
+    '<span class="sub">' + escapeHtml(triggerLabel(out.trigger)) + "</span></div>" +
+    '<div class="toolbar">' +
+      '<a href="' + link(action, keyQ) + '">重新执行</a>' +
+      '<a href="' + link("auto", keyQ) + '">每日签到</a>' +
+      '<a href="' + link("growth", keyQ) + '">成长中心</a>' +
+      '<a href="' + link("log", keyQ) + '">运行日志</a>' +
+      '<a href="' + link(action, keyQ) + '&format=json">原始 JSON</a>' +
+    "</div>" + body;
+  return pageShell("执行结果", inner, false); // 动作页不自动刷新，避免定时重复执行
+}
+
+// 裸访问首页
+function renderHome(env, keyQ) {
+  let accBlock;
+  try {
+    const accs = resolveAccounts(env);
+    const lines = accs.map((a) => {
+      if (a.error) return escapeHtml(displayName(a.name)) + '：<span style="color:#B03A3C;">配置无效（' + escapeHtml(a.error) + "）</span>";
+      let t = "";
+      if (a.tokenInfo) {
+        const expireDate = new Date(a.tokenInfo.expireAt).toISOString().slice(0, 10);
+        t = a.tokenInfo.expired
+          ? '，<span style="color:#B03A3C;">令牌已过期（' + expireDate + "）</span>"
+          : "，令牌剩 " + a.tokenInfo.daysLeft + " 天（" + expireDate + " 到期）";
+      }
+      return escapeHtml(displayName(a.name)) + t;
+    });
+    accBlock = '<div class="card">已配置 <b>' + accs.length + "</b> 个账号：<br>" + lines.join("<br>") + "</div>";
+  } catch (e) {
+    accBlock = '<div class="card warn" style="color:#B03A3C;">' + escapeHtml(String(e.message || e)) + "</div>";
+  }
+
+  const rows = [
+    ["auto", "每日自动化：签到 + 成长中心（Cron 每天执行的就是它）"],
+    ["growth", "只跑成长中心：旅行礼物 / 派出 / 盲盒 / 任务奖励"],
+    ["status", "只查签到状态（调试用，不领取）"],
+    ["claim", "只执行领取（调试用，幂等）"],
+    ["all", "状态 + 领取一起返回（调试用）"],
+    ["log", "查看最近 30 次运行记录（本页面）"],
+  ].map(([act, desc]) =>
+    "<tr><td style=\"white-space:nowrap;\"><a href=\"" + link(act, keyQ) + "\">?action=" + act + "</a></td><td class=\"sub\">" + desc + "</td></tr>"
+  ).join("");
+
+  const inner =
+    '<div class="hd"><h2>WorkBuddy 签到 Worker</h2><span class="sub">云端自动签到 · 幂等可重复执行</span></div>' +
+    accBlock +
+    '<div class="btnrow" style="margin-top:12px;">' +
+      '<a href="' + link("auto", keyQ) + '">▶ 立即签到</a>' +
+      '<a href="' + link("log", keyQ) + '">运行日志</a>' +
+    "</div>" +
+    '<h3>可用操作</h3><div class="tbl-scroll"><table><tbody>' + rows + "</tbody></table></div>" +
+    '<p class="sub" style="margin-top:12px;">提示：浏览器访问展示为页面；程序调用或加 &format=json 时返回 JSON。多账号可用 &account=账号名 只执行其中一个。</p>';
+  return pageShell("WorkBuddy 签到 Worker", inner, false);
+}
+
 /* ---------- Workers 入口 ---------- */
 
+function wantsHtml(url, request) {
+  const fmt = (url.searchParams.get("format") || "").toLowerCase();
+  if (fmt === "json" || url.searchParams.has("raw")) return false;
+  return (request.headers.get("accept") || "").includes("text/html");
+}
+
 export default {
-  // 定时任务：每天自动签到 + 成长中心（对应 Python 的 auto 模式 + 计划任务）
+  // 定时任务：每天自动签到 + 成长中心（对应 Python 的 auto 模式 + 计划任务；多账号全部执行）
   async scheduled(event, env, ctx) {
     const result = await runAction(env, "auto", "cron");
     console.log("[workbuddy-signin] " + JSON.stringify(result.out, null, 2));
     await saveLog(env, result.out);
   },
 
-  // HTTP 触发：GET /?action=auto|growth|status|claim|all|log
+  // HTTP 触发：GET /?action=auto|growth|status|claim|all|log[&i=N][&account=名字][&format=json]
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
 
     // 忽略 favicon 等非根路径请求（浏览器每次访问页面都会自动请求 /favicon.ico，
     // 若不拦截，会触发多余执行并写入多余日志；同时也能挡掉大部分扫描器的路径探测）
     if (url.pathname !== "/") {
+      if ((request.headers.get("accept") || "").includes("text/html")) {
+        return htmlResponse(pageShell("Not Found", '<div class="card">页面不存在，仅支持根路径 <a href="/">/</a> 与 ?action= 参数。</div>', false), 404);
+      }
       return new Response("Not Found", { status: 404 });
     }
 
-    // 不带 ?action= 参数的裸访问只返回说明页，不执行任何动作。
+    const asHtml = wantsHtml(url, request);
+    // 透传 ?key= 到页面内链接（header 方式访问时无 key 可透传）
+    const keyVal = url.searchParams.get("key");
+    const keyQ = keyVal != null ? "&key=" + encodeURIComponent(keyVal) : "";
+
+    // 不带 ?action= 参数的裸访问只返回说明页/首页，不执行任何动作。
     // （公网域名会被扫描器频繁访问，若默认执行 auto，每次扫描都会
     //   白跑一遍签到流程并写一条日志）
     const rawAction = url.searchParams.get("action");
     if (!rawAction) {
+      if (asHtml) return htmlResponse(renderHome(env, keyQ));
       return jsonResponse({
         result: "OK",
-        report: "WorkBuddy 签到 Worker 运行中。请通过 ?action= 参数指定操作：auto（签到+成长中心）/ growth / status / claim / all / log",
+        report: "WorkBuddy 签到 Worker 运行中。请通过 ?action= 参数指定操作：auto（签到+成长中心）/ growth / status / claim / all / log；浏览器访问可看到可视化页面。",
       });
     }
     const action = rawAction.toLowerCase();
 
     if (env.WORKER_SECRET) {
-      const key = url.searchParams.get("key") || request.headers.get("x-worker-key");
+      const key = keyVal || request.headers.get("x-worker-key");
       if (key !== env.WORKER_SECRET) {
+        if (asHtml) {
+          return htmlResponse(pageShell("未授权", '<div class="card warn" style="color:#B03A3C;">缺少或错误的访问密钥（需在 URL 带 ?key=xxx，或请求头 X-Worker-Key）。</div>', false), 401);
+        }
         return jsonResponse({ result: "UNAUTHORIZED", report: "缺少或错误的访问密钥（?key=xxx 或请求头 X-Worker-Key）" }, 401);
       }
     }
 
     if (action === "log") {
       if (!env.KV) {
-        return jsonResponse({ result: "ERROR", report: "未绑定 KV 命名空间（变量名 KV），无法查询历史记录" }, 400);
+        const msg = "未绑定 KV 命名空间（变量名 KV），无法查询历史记录";
+        if (asHtml) return htmlResponse(pageShell("无法查看日志", '<div class="card warn" style="color:#8A5A00;">' + msg + "。</div>", false), 400);
+        return jsonResponse({ result: "ERROR", report: msg }, 400);
       }
-      let history = [];
-      try {
-        history = JSON.parse((await env.KV.get("signin:history")) || "[]");
-      } catch (e) {
-        history = [];
+      const history = await loadHistory(env);
+      const iRaw = url.searchParams.get("i");
+      if (iRaw !== null) {
+        // 详情：?action=log&i=N
+        if (asHtml) return htmlResponse(renderDetail(history, Number(iRaw), keyQ));
+        const e = history[Number(iRaw)] || null;
+        return jsonResponse({ result: "DETAIL", index: Number(iRaw), entry: e });
       }
+      if (asHtml) return htmlResponse(renderLogList(history, keyQ));
       return jsonResponse({ result: "LOG", count: history.length, history: history });
     }
 
-    const result = await runAction(env, action, "http:" + action);
+    const filterAccount = url.searchParams.get("account") || undefined;
+    const result = await runAction(env, action, "http:" + action, filterAccount);
     await saveLog(env, result.out);
+    if (asHtml) return htmlResponse(renderResult(result.out, action, keyQ), result.code === 0 ? 200 : 500);
     return jsonResponse(result.out, result.code === 0 ? 200 : 500);
   },
 };
