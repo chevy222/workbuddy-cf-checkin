@@ -23,25 +23,31 @@
  *   WORKBUDDY_SESSION      单账号：workbuddy-desktop.info 的完整 JSON 内容（兼容旧配置）
  *   WORKBUDDY_TOKEN + WORKBUDDY_UID   单账号简化替代
  *   WORKBUDDY_ENTERPRISE_ID / WORKBUDDY_DOMAIN / WORKBUDDY_ENDPOINT  单账号可选项
- *   WORKER_SECRET          可选；设置后需以 ?key=xxx 或请求头 X-Worker-Key 访问
- *   KV 绑定（变量名 KV）    可选；保存最近 30 次运行记录，?action=log 查看
+ *   WORKER_SECRET          可选；设置后需以 ?key=xxx 或请求头 X-Worker-Key 访问（含首页）
+ *   KV 绑定（变量名 KV）    可选；保存最近 30 次运行记录，/logs 查看
  *
  * 多账号：
  *   - Cron 触发时依次执行全部账号的 auto（签到 + 成长中心），结果聚合为一条运行记录；
- *   - 手动访问可加 &account=账号名 只执行其中一个账号；
+ *   - 手动访问可加 ?account=账号名 只执行其中一个账号；
  *   - 单账号配置的 JSON 输出与旧版完全一致（仅多一个 account 字段）。
+ *
+ * 路由（URL 路径风格）：
+ *   GET /                       首页 / 操作导航（不执行任何动作）
+ *   GET /auto|/growth|/status|/claim|/all   执行对应动作
+ *   GET /logs                   运行日志列表（每 60 秒自动刷新）；/logs/N 查看第 N 条详情
+ *                               （/log 为 /logs 的兼容别名；旧版 /?action=xxx 仍可用）
  *
  * 页面 / 输出：
  *   - 浏览器直接访问（Accept: text/html）返回可视化 HTML 页面：日志表格、详情、执行结果；
- *   - 加 ?format=json（或 &raw=1）强制返回 JSON，curl / 程序调用默认也是 JSON；
- *   - 日志列表页每 60 秒自动刷新；?action=log&i=N 查看第 N 条记录详情。
+ *   - 加 ?format=json（或 ?raw=1）强制返回 JSON，curl / 程序调用默认也是 JSON；
+ *   - 其余参数仍走查询串：?account=账号名、?key=xxx。
  *
  * 用法（全部在 Cloudflare 控制台完成，无需 wrangler）：
  *   - 部署：创建 Worker → 把本文件全部代码粘贴进编辑器 → 部署
  *   - 配置凭据：该 Worker 的 设置 → 变量和机密 → 添加 Secret
  *   - 定时触发：该 Worker 的 设置 → 触发事件 → Cron 触发器 → 添加如 30 1 * * *
  *     （注意 Cron 按 UTC 计算，30 1 * * * = 北京时间每天 09:30），自动执行 auto（签到 + 成长中心）
- *   - 手动触发：浏览器访问 https://<worker域名>/?action=auto|growth|status|claim|all|log
+ *   - 手动触发：浏览器访问 https://<worker域名>/auto （或 /growth /status /claim /all /logs）
  */
 
 const DEFAULT_ENDPOINT = "https://copilot.tencent.com";
@@ -383,8 +389,9 @@ async function runGrowth(headers, endpoint) {
   const energy = e.status >= 200 && e.status < 300 ? dig(e.body, "balance") : null;
 
   const s2 = await get(base + "/streak", headers);
+  // dig 找不到时返回 null；?? null 归一，避免 days 为 undefined 时输出「连签 undefined 天」
   const streakObj = dig(s2.body, "streak") || {};
-  const streakDays = streakObj && typeof streakObj === "object" ? streakObj.days : null;
+  const streakDays = streakObj && typeof streakObj === "object" ? (streakObj.days ?? null) : null;
 
   const tail = [];
   if (energy !== null) tail.push("能量 " + energy);
@@ -454,13 +461,17 @@ async function runAuto(headers, endpoint) {
   if (credit !== null) {
     const s2 = await post(endpoint + "/v2/billing/meter/checkin-activity-status", headers);
     const fresh = s2.status >= 200 && s2.status < 300 && s2.body && typeof s2.body === "object" ? s2.body : status;
-    const streakDays = dig(fresh, "streak_days") || dig(status, "streak_days");
+    // 用 ?? 而非 ||：streak_days 为 0 时不应回退；字段整体缺失时为 null
+    const streakDays = dig(fresh, "streak_days") ?? dig(status, "streak_days");
     const totalCredits = dig(fresh, "total_credits");
     const isStreakDay = dig(fresh, "is_streak_day");
     const nextStreakDay = dig(fresh, "next_streak_day");
-    const bonus = isStreakDay ? "，且为连签奖励日" : "";
-    const cum = totalCredits !== null ? "，累计 " + fmtCredit(totalCredits) + " 积分" : "";
-    const report = "成功领取 " + fmtCredit(credit) + " 积分" + bonus + "（连续 " + streakDays + " 天" + cum + "）";
+    // 各片段缺失时不输出，避免出现「连续 null 天」
+    const tails = [];
+    if (isStreakDay) tails.push("且为连签奖励日");
+    if (streakDays !== null && streakDays !== undefined) tails.push("连续 " + streakDays + " 天");
+    if (totalCredits !== null) tails.push("累计 " + fmtCredit(totalCredits) + " 积分");
+    const report = "成功领取 " + fmtCredit(credit) + " 积分" + (tails.length ? "（" + tails.join("，") + "）" : "");
     return {
       code: 0,
       out: {
@@ -543,7 +554,7 @@ async function runOne(account, action, trigger) {
       break;
     }
     default:
-      return { code: 2, out: { account: account.name, trigger: trigger, result: "BAD_ACTION", report: "未知 action：" + action + "（可选 auto/growth/status/claim/all/log）" } };
+      return { code: 2, out: { account: account.name, trigger: trigger, result: "BAD_ACTION", report: "未知 action：" + action + "（可选 auto/growth/status/claim/all）" } };
   }
 
   // 附上账号名、执行来源与令牌到期预警
@@ -555,8 +566,23 @@ async function runOne(account, action, trigger) {
 
 const GOOD_RESULTS = new Set(["CLAIMED", "ALREADY", "INACTIVE", "GROWTH", "OK"]);
 
+// status/claim/all 等调试动作的输出没有 result 字段，聚合时按其 HTTP 状态归一：
+// 2xx/3xx 算 OK，4xx/5xx/网络异常(-1) 算 ERROR，避免顶层 result 变成 undefined
+function effectiveResult(o) {
+  if (o.result) return o.result;
+  if (o.step) {
+    const n = Number(o.http);
+    return (n >= 200 && n < 400) ? "OK" : "ERROR";
+  }
+  if (o.status && o.claim) {
+    const ok = (x) => { const n = Number(x && x.http); return n >= 200 && n < 400; };
+    return ok(o.status) && ok(o.claim) ? "OK" : "ERROR";
+  }
+  return undefined;
+}
+
 function aggregateResult(outs) {
-  const results = outs.map((o) => o.result);
+  const results = outs.map(effectiveResult);
   const bad = results.filter((x) => !GOOD_RESULTS.has(x));
   if (!bad.length) {
     if (results.every((x) => x === results[0])) return results[0];
@@ -589,7 +615,8 @@ async function runAction(env, action, trigger, filterName) {
     code: code,
     out: {
       result: aggregateResult(outs),
-      report: outs.map((o) => "[" + (o.account || "默认") + "] " + (o.report || "")).join("；"),
+      // 调试动作没有 report，用 debugBrief 生成 "[step] HTTP n"，避免出现 "[账号] ；" 空壳
+      report: outs.map((o) => "[" + (o.account || "默认") + "] " + (o.report || debugBrief(o) || "")).join("；"),
       accounts: outs,
       trigger: trigger,
     },
@@ -732,9 +759,16 @@ function pageShell(title, inner, autoRefresh) {
     '<body><div class="wrap">' + inner + '</div></body></html>';
 }
 
-// 内部链接（透传访问密钥）
-function link(action, keyQ) {
-  return "/?action=" + action + (keyQ || "");
+// 内部链接：动作走 URL 路径（与 trae 版一致），访问密钥等仍走查询串。
+// keyPart 为不含分隔符的查询片段，如 "key=abc"。
+function link(action, keyPart) {
+  return "/" + action + (keyPart ? "?" + keyPart : "");
+}
+
+// 带额外查询参数的内部链接，如 linkQ("logs", keyPart, "format=json")
+function linkQ(action, keyPart, extra) {
+  const q = [keyPart, extra].filter(Boolean).join("&");
+  return "/" + action + (q ? "?" + q : "");
 }
 
 function debugBrief(o) {
@@ -775,8 +809,8 @@ function accountCard(a) {
   return html + "</div>";
 }
 
-// 日志列表页（仿 trae /logs：表格 + 徽章，60 秒自动刷新）
-function renderLogList(history, keyQ) {
+// 日志列表页（路径风格 /logs：表格 + 徽章，60 秒自动刷新）
+function renderLogList(history, keyPart) {
   let rows = "";
   if (!history.length) {
     rows = '<tr><td colspan="5" class="sub" style="padding:18px 10px;">暂无运行记录，点上方「立即签到」执行一次后即可看到。</td></tr>';
@@ -797,7 +831,7 @@ function renderLogList(history, keyQ) {
         row += '<td style="white-space:nowrap;">' + escapeHtml(accLabel) + "</td>";
         row += '<td style="color:#374151;">' + escapeHtml(truncate(note, 120)) + "</td>";
         if (j === 0) {
-          row += '<td rowspan="' + lines.length + '" style="white-space:nowrap;"><a href="/?action=log&i=' + idx + keyQ + '">详情</a></td>';
+          row += '<td rowspan="' + lines.length + '" style="white-space:nowrap;"><a href="' + linkQ("logs", keyPart, "i=" + idx) + '">详情</a></td>';
         }
         row += "</tr>";
         rows += row;
@@ -809,11 +843,11 @@ function renderLogList(history, keyQ) {
     '<div class="hd"><h2>WorkBuddy 签到运行日志</h2>' +
     '<span class="sub">最近 ' + history.length + ' 条运行记录 · 每 60 秒自动刷新 · 仅保留最近 30 次</span></div>' +
     '<div class="toolbar">' +
-      '<a href="' + link("auto", keyQ) + '">▶ 立即签到 (auto)</a>' +
-      '<a href="' + link("growth", keyQ) + '">成长中心</a>' +
-      '<a href="' + link("status", keyQ) + '">查状态</a>' +
-      '<a href="' + link("log", keyQ) + '">刷新</a>' +
-      '<a href="' + link("log", keyQ) + '&format=json">原始 JSON</a>' +
+      '<a href="' + link("auto", keyPart) + '">▶ 立即签到 (/auto)</a>' +
+      '<a href="' + link("growth", keyPart) + '">成长中心</a>' +
+      '<a href="' + link("status", keyPart) + '">查状态</a>' +
+      '<a href="' + link("logs", keyPart) + '">刷新</a>' +
+      '<a href="' + linkQ("logs", keyPart, "format=json") + '">原始 JSON</a>' +
     "</div>" +
     '<div class="tbl-scroll"><table><thead><tr>' +
     "<th>时间(北京)</th><th>结果</th><th>账号</th><th>说明</th><th></th>" +
@@ -822,9 +856,9 @@ function renderLogList(history, keyQ) {
 }
 
 // 日志详情页
-function renderDetail(history, i, keyQ) {
+function renderDetail(history, i, keyPart) {
   const e = history[i];
-  let inner = '<p><a href="' + link("log", keyQ) + '">← 返回日志列表</a></p>';
+  let inner = '<p><a href="' + link("logs", keyPart) + '">← 返回日志列表</a></p>';
   if (!e) {
     inner += '<div class="card sub">记录不存在（可能已被新记录挤出，仅保留最近 30 次运行）。</div>';
   } else {
@@ -835,8 +869,8 @@ function renderDetail(history, i, keyQ) {
 }
 
 // 动作执行结果页
-function renderResult(out, action, keyQ) {
-  const actionName = { auto: "每日签到（auto）", growth: "成长中心", status: "查询签到状态", claim: "领取签到", all: "状态 + 领取" }[action] || action;
+function renderResult(out, action, keyPart) {
+  const actionName = { auto: "每日签到（/auto）", growth: "成长中心", status: "查询签到状态", claim: "领取签到", all: "状态 + 领取" }[action] || action;
   let body = "";
   if (Array.isArray(out.accounts) && out.accounts.length > 1) {
     body += '<div class="card"><div class="cardhd"><span class="accname">汇总</span>' + badgeHtml(out) + "</div>" +
@@ -852,17 +886,17 @@ function renderResult(out, action, keyQ) {
     '<div class="hd"><h2>执行结果 · ' + escapeHtml(actionName) + "</h2>" +
     '<span class="sub">' + escapeHtml(triggerLabel(out.trigger)) + "</span></div>" +
     '<div class="toolbar">' +
-      '<a href="' + link(action, keyQ) + '">重新执行</a>' +
-      '<a href="' + link("auto", keyQ) + '">每日签到</a>' +
-      '<a href="' + link("growth", keyQ) + '">成长中心</a>' +
-      '<a href="' + link("log", keyQ) + '">运行日志</a>' +
-      '<a href="' + link(action, keyQ) + '&format=json">原始 JSON</a>' +
+      '<a href="' + link(action, keyPart) + '">重新执行</a>' +
+      '<a href="' + link("auto", keyPart) + '">每日签到</a>' +
+      '<a href="' + link("growth", keyPart) + '">成长中心</a>' +
+      '<a href="' + link("logs", keyPart) + '">运行日志</a>' +
+      '<a href="' + linkQ(action, keyPart, "format=json") + '">原始 JSON</a>' +
     "</div>" + body;
   return pageShell("执行结果", inner, false); // 动作页不自动刷新，避免定时重复执行
 }
 
 // 裸访问首页
-function renderHome(env, keyQ) {
+function renderHome(env, keyPart) {
   let accBlock;
   try {
     const accs = resolveAccounts(env);
@@ -888,20 +922,20 @@ function renderHome(env, keyQ) {
     ["status", "只查签到状态（调试用，不领取）"],
     ["claim", "只执行领取（调试用，幂等）"],
     ["all", "状态 + 领取一起返回（调试用）"],
-    ["log", "查看最近 30 次运行记录（本页面）"],
+    ["logs", "查看最近 30 次运行记录（本页面）"],
   ].map(([act, desc]) =>
-    "<tr><td style=\"white-space:nowrap;\"><a href=\"" + link(act, keyQ) + "\">?action=" + act + "</a></td><td class=\"sub\">" + desc + "</td></tr>"
+    "<tr><td style=\"white-space:nowrap;\"><a href=\"" + link(act, keyPart) + "\">/" + act + "</a></td><td class=\"sub\">" + desc + "</td></tr>"
   ).join("");
 
   const inner =
     '<div class="hd"><h2>WorkBuddy 签到 Worker</h2><span class="sub">云端自动签到 · 幂等可重复执行</span></div>' +
     accBlock +
     '<div class="btnrow" style="margin-top:12px;">' +
-      '<a href="' + link("auto", keyQ) + '">▶ 立即签到</a>' +
-      '<a href="' + link("log", keyQ) + '">运行日志</a>' +
+      '<a href="' + link("auto", keyPart) + '">▶ 立即签到</a>' +
+      '<a href="' + link("logs", keyPart) + '">运行日志</a>' +
     "</div>" +
     '<h3>可用操作</h3><div class="tbl-scroll"><table><tbody>' + rows + "</tbody></table></div>" +
-    '<p class="sub" style="margin-top:12px;">提示：浏览器访问展示为页面；程序调用或加 &format=json 时返回 JSON。多账号可用 &account=账号名 只执行其中一个。</p>';
+    '<p class="sub" style="margin-top:12px;">提示：动作走 URL 路径（如 /auto、/logs）；浏览器访问展示为页面，程序调用或加 ?format=json 时返回 JSON。多账号可用 ?account=账号名 只执行其中一个。旧版 ?action= 写法仍兼容。</p>';
   return pageShell("WorkBuddy 签到 Worker", inner, false);
 }
 
@@ -913,6 +947,38 @@ function wantsHtml(url, request) {
   return (request.headers.get("accept") || "").includes("text/html");
 }
 
+// 可执行动作集合（日志走独立路由 /logs）
+const ACTION_PATHS = new Set(["auto", "growth", "status", "claim", "all"]);
+
+// URL 路径 → 路由（路径风格，与 trae 版一致；根路径旧写法 ?action= 仍兼容）：
+//   /                       home（说明页，不执行）
+//   /auto ... /all          { kind:"action", action }
+//   /logs、/log             { kind:"logs" }；/logs/N（或 /logs?i=N）→ { kind:"detail", i }
+//   其余任意路径             { kind:"notfound" }
+function parseRoute(url) {
+  const segs = url.pathname.split("/").filter(Boolean);
+  if (!segs.length) {
+    const legacy = url.searchParams.get("action");
+    if (!legacy) return { kind: "home" };
+    const a = String(legacy).toLowerCase();
+    if (a === "log" || a === "logs") {
+      return url.searchParams.get("i") !== null ? { kind: "detail", i: url.searchParams.get("i") } : { kind: "logs" };
+    }
+    if (ACTION_PATHS.has(a)) return { kind: "action", action: a };
+    return { kind: "notfound" };
+  }
+  const first = String(segs[0]).toLowerCase();
+  if (first === "log" || first === "logs") {
+    if (segs.length === 1) {
+      return url.searchParams.get("i") !== null ? { kind: "detail", i: url.searchParams.get("i") } : { kind: "logs" };
+    }
+    if (segs.length === 2) return { kind: "detail", i: segs[1] };
+    return { kind: "notfound" };
+  }
+  if (segs.length === 1 && ACTION_PATHS.has(first)) return { kind: "action", action: first };
+  return { kind: "notfound" };
+}
+
 export default {
   // 定时任务：每天自动签到 + 成长中心（对应 Python 的 auto 模式 + 计划任务；多账号全部执行）
   async scheduled(event, env, ctx) {
@@ -921,15 +987,20 @@ export default {
     await saveLog(env, result.out);
   },
 
-  // HTTP 触发：GET /?action=auto|growth|status|claim|all|log[&i=N][&account=名字][&format=json]
+  // HTTP 触发（URL 路径风格；旧版 /?action= 仍兼容）：
+  //   GET /                       首页/导航（不执行动作）
+  //   GET /auto|/growth|/status|/claim|/all                  执行对应动作
+  //   GET /logs                   日志列表；/logs/N（或 /logs?i=N）第 N 条详情（/log 为别名）
+  //   查询串：?account=名字（多账号筛选）、?key=xxx（访问密钥）、?format=json、?raw=1
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
+    const route = parseRoute(url);
 
-    // 忽略 favicon 等非根路径请求（浏览器每次访问页面都会自动请求 /favicon.ico，
-    // 若不拦截，会触发多余执行并写入多余日志；同时也能挡掉大部分扫描器的路径探测）
-    if (url.pathname !== "/") {
+    // 未知路径（含 /favicon.ico 与扫描器探测）：一律 404，不执行动作、不写日志
+    if (route.kind === "notfound") {
       if ((request.headers.get("accept") || "").includes("text/html")) {
-        return htmlResponse(pageShell("Not Found", '<div class="card">页面不存在，仅支持根路径 <a href="/">/</a> 与 ?action= 参数。</div>', false), 404);
+        return htmlResponse(pageShell("Not Found",
+          '<div class="card">页面不存在。返回 <a href="/">首页</a>，可用路径：/auto、/growth、/status、/claim、/all、/logs。</div>', false), 404);
       }
       return new Response("Not Found", { status: 404 });
     }
@@ -937,21 +1008,10 @@ export default {
     const asHtml = wantsHtml(url, request);
     // 透传 ?key= 到页面内链接（header 方式访问时无 key 可透传）
     const keyVal = url.searchParams.get("key");
-    const keyQ = keyVal != null ? "&key=" + encodeURIComponent(keyVal) : "";
+    const keyPart = keyVal != null ? "key=" + encodeURIComponent(keyVal) : "";
 
-    // 不带 ?action= 参数的裸访问只返回说明页/首页，不执行任何动作。
-    // （公网域名会被扫描器频繁访问，若默认执行 auto，每次扫描都会
-    //   白跑一遍签到流程并写一条日志）
-    const rawAction = url.searchParams.get("action");
-    if (!rawAction) {
-      if (asHtml) return htmlResponse(renderHome(env, keyQ));
-      return jsonResponse({
-        result: "OK",
-        report: "WorkBuddy 签到 Worker 运行中。请通过 ?action= 参数指定操作：auto（签到+成长中心）/ growth / status / claim / all / log；浏览器访问可看到可视化页面。",
-      });
-    }
-    const action = rawAction.toLowerCase();
-
+    // 配置 WORKER_SECRET 后，所有页面与动作（含首页）都需要密钥，
+    // 避免首页泄露账号数量、昵称与令牌到期时间
     if (env.WORKER_SECRET) {
       const key = keyVal || request.headers.get("x-worker-key");
       if (key !== env.WORKER_SECRET) {
@@ -962,28 +1022,39 @@ export default {
       }
     }
 
-    if (action === "log") {
+    // 裸访问首页：只返回说明页/首页，不执行任何动作。
+    // （公网域名会被扫描器频繁访问，若默认执行 auto，每次扫描都会
+    //   白跑一遍签到流程并写一条日志）
+    if (route.kind === "home") {
+      if (asHtml) return htmlResponse(renderHome(env, keyPart));
+      return jsonResponse({
+        result: "OK",
+        report: "WorkBuddy 签到 Worker 运行中。路径：/auto（签到+成长中心）、/growth、/status、/claim、/all、/logs（运行日志）；浏览器访问为可视化页面，旧版 ?action= 写法仍兼容。",
+      });
+    }
+
+    if (route.kind === "logs" || route.kind === "detail") {
       if (!env.KV) {
         const msg = "未绑定 KV 命名空间（变量名 KV），无法查询历史记录";
         if (asHtml) return htmlResponse(pageShell("无法查看日志", '<div class="card warn" style="color:#8A5A00;">' + msg + "。</div>", false), 400);
         return jsonResponse({ result: "ERROR", report: msg }, 400);
       }
       const history = await loadHistory(env);
-      const iRaw = url.searchParams.get("i");
-      if (iRaw !== null) {
-        // 详情：?action=log&i=N
-        if (asHtml) return htmlResponse(renderDetail(history, Number(iRaw), keyQ));
-        const e = history[Number(iRaw)] || null;
-        return jsonResponse({ result: "DETAIL", index: Number(iRaw), entry: e });
+      if (route.kind === "detail") {
+        // 详情：/logs/N 或 /logs?i=N（旧版 ?action=log&i=N 同效）
+        const idx = Number(route.i);
+        if (asHtml) return htmlResponse(renderDetail(history, idx, keyPart));
+        return jsonResponse({ result: "DETAIL", index: idx, entry: history[idx] || null });
       }
-      if (asHtml) return htmlResponse(renderLogList(history, keyQ));
+      if (asHtml) return htmlResponse(renderLogList(history, keyPart));
       return jsonResponse({ result: "LOG", count: history.length, history: history });
     }
 
+    const action = route.action;
     const filterAccount = url.searchParams.get("account") || undefined;
     const result = await runAction(env, action, "http:" + action, filterAccount);
     await saveLog(env, result.out);
-    if (asHtml) return htmlResponse(renderResult(result.out, action, keyQ), result.code === 0 ? 200 : 500);
+    if (asHtml) return htmlResponse(renderResult(result.out, action, keyPart), result.code === 0 ? 200 : 500);
     return jsonResponse(result.out, result.code === 0 ? 200 : 500);
   },
 };
