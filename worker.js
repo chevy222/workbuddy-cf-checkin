@@ -33,13 +33,13 @@
  *
  * 路由（URL 路径风格）：
  *   GET /                       首页 / 操作导航（不执行任何动作）
- *   GET /auto|/growth|/status|/claim|/all   执行对应动作
+ *   GET /auto|/growth|/status|/claim    执行对应动作
  *   GET /logs                   运行日志列表（每 60 秒自动刷新）；/logs/N 查看第 N 条详情
- *                               （/log 为 /logs 的兼容别名；旧版 /?action=xxx 仍可用）
+ *                               （/log 为 /logs 的兼容别名）
  *
  * 页面 / 输出：
  *   - 浏览器直接访问（Accept: text/html）返回可视化 HTML 页面：日志表格、详情、执行结果；
- *   - 加 ?format=json（或 ?raw=1）强制返回 JSON，curl / 程序调用默认也是 JSON；
+ *   - curl / 程序调用（不带 Accept: text/html）返回 JSON；
  *   - 其余参数仍走查询串：?account=账号名、?key=xxx。
  *
  * 用法（全部在 Cloudflare 控制台完成，无需 wrangler）：
@@ -47,7 +47,7 @@
  *   - 配置凭据：该 Worker 的 设置 → 变量和机密 → 添加 Secret
  *   - 定时触发：该 Worker 的 设置 → 触发事件 → Cron 触发器 → 添加如 30 1 * * *
  *     （注意 Cron 按 UTC 计算，30 1 * * * = 北京时间每天 09:30），自动执行 auto（签到 + 成长中心）
- *   - 手动触发：浏览器访问 https://<worker域名>/auto （或 /growth /status /claim /all /logs）
+ *   - 手动触发：浏览器访问 https://<worker域名>/auto （或 /growth /status /claim /logs）
  */
 
 const DEFAULT_ENDPOINT = "https://copilot.tencent.com";
@@ -284,7 +284,7 @@ function isAlreadyCheckedIn(cbody) {
 }
 
 function alreadyReport(status, via = null) {
-  const todayCredit = dig(status, "today_credit") || dig(status, "daily_credit");
+  const todayCredit = dig(status, "today_credit") ?? dig(status, "daily_credit");
   const streakDays = dig(status, "streak_days");
   const totalCredits = dig(status, "total_credits");
   const isStreakDay = dig(status, "is_streak_day");
@@ -352,17 +352,21 @@ async function runGrowth(headers, endpoint) {
     parts.push("Buddy 旅行中（" + locName + "）");
   }
 
-  // --- 2. 盲盒/抽奖 ---
+  // --- 2. 盲盒/抽奖（余额有多少次就抽多少次，上限 10 次防御异常余额） ---
   const l = await get(base + "/lottery/chances", headers);
   const chances = l.status >= 200 && l.status < 300 ? (dig(l.body, "balance") || 0) : 0;
   if (chances > 0) {
-    const d = await post(base + "/lottery/draw", headers, {});
-    if (d.status >= 200 && d.status < 300) {
-      const prize = dig(d.body, "prize_name") || dig(d.body, "prize") || "未知";
-      parts.push("开盲盒获得：" + prize);
-    } else {
-      parts.push("开盲盒失败（HTTP " + d.status + "）");
+    const prizes = [];
+    for (let i = 0; i < Math.min(chances, 10); i++) {
+      const d = await post(base + "/lottery/draw", headers, {});
+      if (d.status >= 200 && d.status < 300) {
+        prizes.push(dig(d.body, "prize_name") || dig(d.body, "prize") || "未知");
+      } else {
+        parts.push("开盲盒失败（HTTP " + d.status + "）");
+        break;
+      }
     }
+    if (prizes.length) parts.push("开盲盒获得：" + prizes.join("、"));
   }
 
   // --- 3. 任务领奖 ---
@@ -541,20 +545,8 @@ async function runOne(account, action, trigger) {
       r = { code: 0, out: { step: "claim", http: c.status, body: c.body } };
       break;
     }
-    case "all": {
-      const s = await post(endpoint + "/v2/billing/meter/checkin-activity-status", headers);
-      const c = await post(endpoint + "/v2/billing/meter/daily-checkin", headers);
-      r = {
-        code: 0,
-        out: {
-          status: { http: s.status, body: s.body },
-          claim: { http: c.status, body: c.body },
-        },
-      };
-      break;
-    }
     default:
-      return { code: 2, out: { account: account.name, trigger: trigger, result: "BAD_ACTION", report: "未知 action：" + action + "（可选 auto/growth/status/claim/all）" } };
+      return { code: 2, out: { account: account.name, trigger: trigger, result: "BAD_ACTION", report: "未知 action：" + action + "（可选 auto/growth/status/claim）" } };
   }
 
   // 附上账号名、执行来源与令牌到期预警
@@ -566,17 +558,13 @@ async function runOne(account, action, trigger) {
 
 const GOOD_RESULTS = new Set(["CLAIMED", "ALREADY", "INACTIVE", "GROWTH", "OK"]);
 
-// status/claim/all 等调试动作的输出没有 result 字段，聚合时按其 HTTP 状态归一：
+// status/claim 等调试动作的输出没有 result 字段，聚合时按其 HTTP 状态归一：
 // 2xx/3xx 算 OK，4xx/5xx/网络异常(-1) 算 ERROR，避免顶层 result 变成 undefined
 function effectiveResult(o) {
   if (o.result) return o.result;
   if (o.step) {
     const n = Number(o.http);
     return (n >= 200 && n < 400) ? "OK" : "ERROR";
-  }
-  if (o.status && o.claim) {
-    const ok = (x) => { const n = Number(x && x.http); return n >= 200 && n < 400; };
-    return ok(o.status) && ok(o.claim) ? "OK" : "ERROR";
   }
   return undefined;
 }
@@ -634,7 +622,6 @@ async function saveLog(env, out) {
     " " + p(d.getUTCHours()) + ":" + p(d.getUTCMinutes()) + ":" + p(d.getUTCSeconds());
   const entry = { time: time, ...out };
   try {
-    await env.KV.put("signin:last", JSON.stringify(entry));
     let history = [];
     try {
       history = JSON.parse((await env.KV.get("signin:history")) || "[]");
@@ -729,17 +716,17 @@ h3{font-size:14px;margin:16px 0 6px;}
 .sub{font-size:12px;color:#6B7280;}
 hr{border:none;border-top:1px solid #E4E3DD;margin:12px 0;}
 a{color:#2E7E96;text-decoration:none;} a:hover{text-decoration:underline;}
-.toolbar{display:flex;gap:16px;flex-wrap:wrap;margin:10px 0;font-size:13px;}
+code{background:rgba(46,126,150,.08);border:1px solid rgba(46,126,150,.18);border-radius:4px;padding:0 4px;font-size:12px;}
 .tbl-scroll{overflow-x:auto;}
 table{width:100%;border-collapse:collapse;background:#fff;border:1px solid #E4E3DD;border-radius:12px;overflow:hidden;}
 th{text-align:left;background:rgba(163,213,232,.18);font-size:12px;color:#374151;padding:8px 10px;font-weight:600;white-space:nowrap;}
 td{padding:8px 10px;font-size:13px;border-top:1px solid #F0EFEA;vertical-align:top;}
 .badge{display:inline-block;padding:2px 9px;border-radius:10px;font-size:12px;white-space:nowrap;}
-.b-claimed{background:rgba(82,196,26,.14);color:#2F6B12;}
-.b-already,.b-growth,.b-ok,.b-debug{background:rgba(139,200,234,.22);color:#25607A;}
-.b-inactive{background:rgba(0,0,0,.06);color:#6B7280;}
-.b-no_session,.b-token_expired{background:rgba(234,102,104,.14);color:#B03A3C;}
-.b-error,.b-unknown,.b-partial_failed,.b-failed{background:rgba(250,173,20,.20);color:#8A5A00;}
+/* 徽章配色与 trae 版统一：成功/已签=绿，错误/登录失效=红，中性=灰，信息=蓝 */
+.b-claimed,.b-already,.b-growth{background:rgba(82,196,26,.14);color:#2F6B12;}
+.b-ok,.b-debug{background:rgba(139,200,234,.22);color:#25607A;}
+.b-inactive{background:rgba(0,0,0,.05);color:#5B6470;}
+.b-no_session,.b-token_expired,.b-error,.b-unknown,.b-partial_failed,.b-failed{background:rgba(234,102,104,.12);color:#A33D3F;}
 .card{background:#fff;border:1px solid #E4E3DD;border-radius:12px;padding:12px 14px;margin:10px 0;}
 .cardhd{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-bottom:4px;}
 .accname{font-weight:600;font-size:14px;}
@@ -765,7 +752,7 @@ function link(action, keyPart) {
   return "/" + action + (keyPart ? "?" + keyPart : "");
 }
 
-// 带额外查询参数的内部链接，如 linkQ("logs", keyPart, "format=json")
+// 带额外查询参数的内部链接，如 linkQ("logs", keyPart, "i=0")
 function linkQ(action, keyPart, extra) {
   const q = [keyPart, extra].filter(Boolean).join("&");
   return "/" + action + (q ? "?" + q : "");
@@ -774,8 +761,19 @@ function linkQ(action, keyPart, extra) {
 function debugBrief(o) {
   if (!o) return "";
   if (o.step) return "[" + o.step + "] HTTP " + o.http;
-  if (o.status && o.claim) return "[all] status HTTP " + o.status.http + " / claim HTTP " + o.claim.http;
   return "";
+}
+
+// 顶部工具条：胶囊按钮，与 trae 版统一样式（首页本身不用，避免出现指向自己的"首页"按钮）
+function toolbar(keyPart) {
+  const home = "/" + (keyPart ? "?" + keyPart : "");
+  return '<div class="btnrow" style="margin-top:4px;">' +
+    '<a href="' + link("auto", keyPart) + '">▶ 立即签到</a>' +
+    '<a href="' + link("growth", keyPart) + '">成长中心</a>' +
+    '<a href="' + link("logs", keyPart) + '">运行日志</a>' +
+    '<a href="' + link("status", keyPart) + '">查状态</a>' +
+    '<a href="' + home + '">首页</a>' +
+    "</div>";
 }
 
 // 单账号兼容配置的内部名 default 不直接展示给用户
@@ -803,8 +801,8 @@ function accountCard(a) {
     '</div><div class="report">' + escapeHtml(a.report || debugBrief(a) || "-") + "</div>";
   if (a.growth) html += '<div class="meta">成长中心：' + escapeHtml(a.growth) + "</div>";
   if (meta.length) html += '<div class="meta">' + meta.map(escapeHtml).join(" · ") + "</div>";
-  if (a.step || (a.status && a.claim)) {
-    html += "<details><summary>查看接口原始返回</summary><pre>" + escapeHtml(JSON.stringify(a.step ? a.body : { status: a.status, claim: a.claim }, null, 2)) + "</pre></details>";
+  if (a.step) {
+    html += "<details><summary>查看接口原始返回</summary><pre>" + escapeHtml(JSON.stringify(a.body, null, 2)) + "</pre></details>";
   }
   return html + "</div>";
 }
@@ -842,13 +840,8 @@ function renderLogList(history, keyPart) {
   const inner =
     '<div class="hd"><h2>WorkBuddy 签到运行日志</h2>' +
     '<span class="sub">最近 ' + history.length + ' 条运行记录 · 每 60 秒自动刷新 · 仅保留最近 30 次</span></div>' +
-    '<div class="toolbar">' +
-      '<a href="' + link("auto", keyPart) + '">▶ 立即签到 (/auto)</a>' +
-      '<a href="' + link("growth", keyPart) + '">成长中心</a>' +
-      '<a href="' + link("status", keyPart) + '">查状态</a>' +
-      '<a href="' + link("logs", keyPart) + '">刷新</a>' +
-      '<a href="' + linkQ("logs", keyPart, "format=json") + '">原始 JSON</a>' +
-    "</div>" +
+    toolbar(keyPart) +
+    "<hr>" +
     '<div class="tbl-scroll"><table><thead><tr>' +
     "<th>时间(北京)</th><th>结果</th><th>账号</th><th>说明</th><th></th>" +
     "</tr></thead><tbody>" + rows + "</tbody></table></div>";
@@ -858,7 +851,7 @@ function renderLogList(history, keyPart) {
 // 日志详情页
 function renderDetail(history, i, keyPart) {
   const e = history[i];
-  let inner = '<p><a href="' + link("logs", keyPart) + '">← 返回日志列表</a></p>';
+  let inner = toolbar(keyPart);
   if (!e) {
     inner += '<div class="card sub">记录不存在（可能已被新记录挤出，仅保留最近 30 次运行）。</div>';
   } else {
@@ -870,7 +863,7 @@ function renderDetail(history, i, keyPart) {
 
 // 动作执行结果页
 function renderResult(out, action, keyPart) {
-  const actionName = { auto: "每日签到（/auto）", growth: "成长中心", status: "查询签到状态", claim: "领取签到", all: "状态 + 领取" }[action] || action;
+  const actionName = { auto: "每日签到（/auto）", growth: "成长中心", status: "查询签到状态", claim: "领取签到" }[action] || action;
   let body = "";
   if (Array.isArray(out.accounts) && out.accounts.length > 1) {
     body += '<div class="card"><div class="cardhd"><span class="accname">汇总</span>' + badgeHtml(out) + "</div>" +
@@ -885,13 +878,7 @@ function renderResult(out, action, keyPart) {
   const inner =
     '<div class="hd"><h2>执行结果 · ' + escapeHtml(actionName) + "</h2>" +
     '<span class="sub">' + escapeHtml(triggerLabel(out.trigger)) + "</span></div>" +
-    '<div class="toolbar">' +
-      '<a href="' + link(action, keyPart) + '">重新执行</a>' +
-      '<a href="' + link("auto", keyPart) + '">每日签到</a>' +
-      '<a href="' + link("growth", keyPart) + '">成长中心</a>' +
-      '<a href="' + link("logs", keyPart) + '">运行日志</a>' +
-      '<a href="' + linkQ(action, keyPart, "format=json") + '">原始 JSON</a>' +
-    "</div>" + body;
+    toolbar(keyPart) + body;
   return pageShell("执行结果", inner, false); // 动作页不自动刷新，避免定时重复执行
 }
 
@@ -919,9 +906,8 @@ function renderHome(env, keyPart) {
   const rows = [
     ["auto", "每日自动化：签到 + 成长中心（Cron 每天执行的就是它）"],
     ["growth", "只跑成长中心：旅行礼物 / 派出 / 盲盒 / 任务奖励"],
-    ["status", "只查签到状态（调试用，不领取）"],
-    ["claim", "只执行领取（调试用，幂等）"],
-    ["all", "状态 + 领取一起返回（调试用）"],
+    ["status", "只查签到状态（调试用，不领取，不写入日志）"],
+    ["claim", "只执行领取（调试用，幂等，不写入日志）"],
     ["logs", "查看最近 30 次运行记录（本页面）"],
   ].map(([act, desc]) =>
     "<tr><td style=\"white-space:nowrap;\"><a href=\"" + link(act, keyPart) + "\">/" + act + "</a></td><td class=\"sub\">" + desc + "</td></tr>"
@@ -930,43 +916,32 @@ function renderHome(env, keyPart) {
   const inner =
     '<div class="hd"><h2>WorkBuddy 签到 Worker</h2><span class="sub">云端自动签到 · 幂等可重复执行</span></div>' +
     accBlock +
-    '<div class="btnrow" style="margin-top:12px;">' +
+    '<div class="btnrow" style="margin-top:6px;">' +
       '<a href="' + link("auto", keyPart) + '">▶ 立即签到</a>' +
       '<a href="' + link("logs", keyPart) + '">运行日志</a>' +
     "</div>" +
     '<h3>可用操作</h3><div class="tbl-scroll"><table><tbody>' + rows + "</tbody></table></div>" +
-    '<p class="sub" style="margin-top:12px;">提示：动作走 URL 路径（如 /auto、/logs）；浏览器访问展示为页面，程序调用或加 ?format=json 时返回 JSON。多账号可用 ?account=账号名 只执行其中一个。旧版 ?action= 写法仍兼容。</p>';
+    '<p class="sub" style="margin-top:12px;">提示：<code>/auto</code>、<code>/growth</code>、<code>/status</code>、<code>/claim</code>、<code>/logs</code> 浏览器可直接打开；程序调用时返回 JSON。多账号可用 <code>?account=账号名</code> 只执行其中一个。</p>';
   return pageShell("WorkBuddy 签到 Worker", inner, false);
 }
 
 /* ---------- Workers 入口 ---------- */
 
 function wantsHtml(url, request) {
-  const fmt = (url.searchParams.get("format") || "").toLowerCase();
-  if (fmt === "json" || url.searchParams.has("raw")) return false;
   return (request.headers.get("accept") || "").includes("text/html");
 }
 
 // 可执行动作集合（日志走独立路由 /logs）
-const ACTION_PATHS = new Set(["auto", "growth", "status", "claim", "all"]);
+const ACTION_PATHS = new Set(["auto", "growth", "status", "claim"]);
 
-// URL 路径 → 路由（路径风格，与 trae 版一致；根路径旧写法 ?action= 仍兼容）：
+// URL 路径 → 路由（路径风格，与 trae 版一致）：
 //   /                       home（说明页，不执行）
-//   /auto ... /all          { kind:"action", action }
+//   /auto ... /claim        { kind:"action", action }
 //   /logs、/log             { kind:"logs" }；/logs/N（或 /logs?i=N）→ { kind:"detail", i }
 //   其余任意路径             { kind:"notfound" }
 function parseRoute(url) {
   const segs = url.pathname.split("/").filter(Boolean);
-  if (!segs.length) {
-    const legacy = url.searchParams.get("action");
-    if (!legacy) return { kind: "home" };
-    const a = String(legacy).toLowerCase();
-    if (a === "log" || a === "logs") {
-      return url.searchParams.get("i") !== null ? { kind: "detail", i: url.searchParams.get("i") } : { kind: "logs" };
-    }
-    if (ACTION_PATHS.has(a)) return { kind: "action", action: a };
-    return { kind: "notfound" };
-  }
+  if (!segs.length) return { kind: "home" };
   const first = String(segs[0]).toLowerCase();
   if (first === "log" || first === "logs") {
     if (segs.length === 1) {
@@ -987,11 +962,11 @@ export default {
     await saveLog(env, result.out);
   },
 
-  // HTTP 触发（URL 路径风格；旧版 /?action= 仍兼容）：
+  // HTTP 触发（URL 路径风格）：
   //   GET /                       首页/导航（不执行动作）
-  //   GET /auto|/growth|/status|/claim|/all                  执行对应动作
+  //   GET /auto|/growth|/status|/claim                      执行对应动作
   //   GET /logs                   日志列表；/logs/N（或 /logs?i=N）第 N 条详情（/log 为别名）
-  //   查询串：?account=名字（多账号筛选）、?key=xxx（访问密钥）、?format=json、?raw=1
+  //   查询串：?account=名字（多账号筛选）、?key=xxx（访问密钥）
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
     const route = parseRoute(url);
@@ -1000,7 +975,7 @@ export default {
     if (route.kind === "notfound") {
       if ((request.headers.get("accept") || "").includes("text/html")) {
         return htmlResponse(pageShell("Not Found",
-          '<div class="card">页面不存在。返回 <a href="/">首页</a>，可用路径：/auto、/growth、/status、/claim、/all、/logs。</div>', false), 404);
+          '<div class="card">页面不存在。返回 <a href="/">首页</a>，可用路径：/auto、/growth、/status、/claim、/logs。</div>', false), 404);
       }
       return new Response("Not Found", { status: 404 });
     }
@@ -1029,7 +1004,7 @@ export default {
       if (asHtml) return htmlResponse(renderHome(env, keyPart));
       return jsonResponse({
         result: "OK",
-        report: "WorkBuddy 签到 Worker 运行中。路径：/auto（签到+成长中心）、/growth、/status、/claim、/all、/logs（运行日志）；浏览器访问为可视化页面，旧版 ?action= 写法仍兼容。",
+        report: "WorkBuddy 签到 Worker 运行中。路径：/auto（签到+成长中心）、/growth、/status、/claim、/logs（运行日志）；浏览器访问为可视化页面，旧版 JSON 输出形态仍兼容。",
       });
     }
 
@@ -1041,7 +1016,7 @@ export default {
       }
       const history = await loadHistory(env);
       if (route.kind === "detail") {
-        // 详情：/logs/N 或 /logs?i=N（旧版 ?action=log&i=N 同效）
+        // 详情：/logs/N 或 /logs?i=N
         const idx = Number(route.i);
         if (asHtml) return htmlResponse(renderDetail(history, idx, keyPart));
         return jsonResponse({ result: "DETAIL", index: idx, entry: history[idx] || null });
@@ -1053,7 +1028,8 @@ export default {
     const action = route.action;
     const filterAccount = url.searchParams.get("account") || undefined;
     const result = await runAction(env, action, "http:" + action, filterAccount);
-    await saveLog(env, result.out);
+    // 只有 auto / growth 写入运行日志；status / claim 为调试动作，避免刷屏淹没真正的签到记录
+    if (action === "auto" || action === "growth") await saveLog(env, result.out);
     if (asHtml) return htmlResponse(renderResult(result.out, action, keyPart), result.code === 0 ? 200 : 500);
     return jsonResponse(result.out, result.code === 0 ? 200 : 500);
   },
