@@ -135,7 +135,7 @@ function buildAccount(conf, index, env) {
   }
 
   const headers = buildHeaders(session); // 缺 token/uid 时在此抛错
-  const endpoint = ((((session.auth || {}).endpoint)) || conf.endpoint || env.WORKBUDDY_ENDPOINT || DEFAULT_ENDPOINT).replace(/\/+$/, "");
+  const endpoint = ((session.auth || {}).endpoint || conf.endpoint || env.WORKBUDDY_ENDPOINT || DEFAULT_ENDPOINT).replace(/\/+$/, "");
   const tokenInfo = inspectToken(session.auth.accessToken);
   const acc = (session.account || {});
   const fallbackName = acc.nickname || acc.name || ("账号" + (index + 1));
@@ -749,12 +749,7 @@ function pageShell(title, inner, autoRefresh) {
 }
 
 // 内部链接：动作走 URL 路径（与 trae 版一致），访问密钥等仍走查询串。
-// keyPart 为不含分隔符的查询片段，如 "key=abc"。
-function link(action, keyPart) {
-  return "/" + action + (keyPart ? "?" + keyPart : "");
-}
-
-// 带额外查询参数的内部链接，如 linkQ("logs", keyPart, "i=0")
+// keyPart 为不含分隔符的查询片段，如 "key=abc"；extra 为可选的额外查询参数，如 "i=0"。
 function linkQ(action, keyPart, extra) {
   const q = [keyPart, extra].filter(Boolean).join("&");
   return "/" + action + (q ? "?" + q : "");
@@ -770,10 +765,10 @@ function debugBrief(o) {
 function toolbar(keyPart) {
   const home = "/" + (keyPart ? "?" + keyPart : "");
   return '<div class="btnrow" style="margin-top:4px;">' +
-    '<a href="' + link("auto", keyPart) + '">▶ 立即签到</a>' +
-    '<a href="' + link("growth", keyPart) + '">成长中心</a>' +
-    '<a href="' + link("logs", keyPart) + '">运行日志</a>' +
-    '<a href="' + link("status", keyPart) + '">查状态</a>' +
+    '<a href="' + linkQ("auto", keyPart) + '">▶ 立即签到</a>' +
+    '<a href="' + linkQ("growth", keyPart) + '">成长中心</a>' +
+    '<a href="' + linkQ("logs", keyPart) + '">运行日志</a>' +
+    '<a href="' + linkQ("status", keyPart) + '">查状态</a>' +
     '<a href="' + home + '">首页</a>' +
     "</div>";
 }
@@ -912,15 +907,15 @@ function renderHome(env, keyPart) {
     ["claim", "只执行领取（调试用，幂等，不写入日志）"],
     ["logs", "查看最近 30 次运行记录（本页面）"],
   ].map(([act, desc]) =>
-    "<tr><td style=\"white-space:nowrap;\"><a href=\"" + link(act, keyPart) + "\">/" + act + "</a></td><td class=\"sub\">" + desc + "</td></tr>"
+    "<tr><td style=\"white-space:nowrap;\"><a href=\"" + linkQ(act, keyPart) + "\">/" + act + "</a></td><td class=\"sub\">" + desc + "</td></tr>"
   ).join("");
 
   const inner =
     '<div class="hd"><h2>WorkBuddy 签到 Worker</h2><span class="sub">云端自动签到 · 幂等可重复执行</span></div>' +
     accBlock +
     '<div class="btnrow" style="margin-top:6px;">' +
-      '<a href="' + link("auto", keyPart) + '">▶ 立即签到</a>' +
-      '<a href="' + link("logs", keyPart) + '">运行日志</a>' +
+      '<a href="' + linkQ("auto", keyPart) + '">▶ 立即签到</a>' +
+      '<a href="' + linkQ("logs", keyPart) + '">运行日志</a>' +
     "</div>" +
     '<h3>可用操作</h3><div class="tbl-scroll"><table><tbody>' + rows + "</tbody></table></div>" +
     '<p class="sub" style="margin-top:12px;">提示：<code>/auto</code>、<code>/growth</code>、<code>/status</code>、<code>/claim</code>、<code>/logs</code> 浏览器可直接打开；程序调用时返回 JSON。多账号可用 <code>?account=账号名</code> 只执行其中一个。</p>';
@@ -929,7 +924,7 @@ function renderHome(env, keyPart) {
 
 /* ---------- Workers 入口 ---------- */
 
-function wantsHtml(url, request) {
+function wantsHtml(request) {
   return (request.headers.get("accept") || "").includes("text/html");
 }
 
@@ -982,7 +977,7 @@ export default {
       return new Response("Not Found", { status: 404 });
     }
 
-    const asHtml = wantsHtml(url, request);
+    const asHtml = wantsHtml(request);
     // 透传 ?key= 到页面内链接（header 方式访问时无 key 可透传）
     const keyVal = url.searchParams.get("key");
     const keyPart = keyVal != null ? "key=" + encodeURIComponent(keyVal) : "";
