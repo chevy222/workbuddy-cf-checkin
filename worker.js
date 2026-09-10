@@ -88,13 +88,21 @@ function get(url, headers) {
 
 /* ---------- 凭据：单账号头部构建 / 多账号解析 ---------- */
 
+// 统一构造"带结果码"的错误，让调用方区分配置错误 / 账号不存在 / 登录失效。
+// 避免所有异常都被笼统报成 NO_SESSION——用户看到"登录失效"会去重新登录，白折腾一趟。
+function fail(result, message) {
+  const e = new Error(message);
+  e.result = result;
+  return e;
+}
+
 function buildHeaders(session) {
   const auth = (session && session.auth) || {};
   const account = (session && session.account) || {};
   const token = auth.accessToken;
   const uid = account.uid;
   if (!token || !uid) {
-    throw new Error("NO_SESSION: 会话凭据中缺少 accessToken 或 uid");
+    throw fail("CONFIG_ERROR", "会话凭据中缺少 accessToken 或 uid");
   }
   const headers = {
     "Accept": "application/json",
@@ -151,16 +159,20 @@ function resolveAccounts(env, filterName) {
     try {
       arr = JSON.parse(env.WORKBUDDY_ACCOUNTS);
     } catch (e) {
-      throw new Error("NO_SESSION: WORKBUDDY_ACCOUNTS 不是合法 JSON（需为数组，每项含 name 与 session 或 token+uid）");
+      throw fail("CONFIG_ERROR", "WORKBUDDY_ACCOUNTS 不是合法 JSON（需为数组，每项含 name 与 session 或 token+uid）");
     }
     if (!Array.isArray(arr) || !arr.length) {
-      throw new Error("NO_SESSION: WORKBUDDY_ACCOUNTS 必须是非空 JSON 数组");
+      throw fail("CONFIG_ERROR", "WORKBUDDY_ACCOUNTS 必须是非空 JSON 数组");
     }
     arr.forEach((conf, i) => {
       try {
         accounts.push(buildAccount(conf, i, env));
       } catch (e) {
-        accounts.push({ name: (conf && conf.name) || ("账号" + (i + 1)), error: String(e.message || e) });
+        accounts.push({
+          name: (conf && conf.name) || ("账号" + (i + 1)),
+          error: String(e.message || e),
+          result: (e && e.result) || "CONFIG_ERROR",
+        });
       }
     });
   } else {
@@ -170,7 +182,7 @@ function resolveAccounts(env, filterName) {
       try {
         session = JSON.parse(env.WORKBUDDY_SESSION);
       } catch (e) {
-        throw new Error("NO_SESSION: WORKBUDDY_SESSION 不是合法 JSON");
+        throw fail("CONFIG_ERROR", "WORKBUDDY_SESSION 不是合法 JSON");
       }
     } else if (env.WORKBUDDY_TOKEN && env.WORKBUDDY_UID) {
       session = {
@@ -181,8 +193,8 @@ function resolveAccounts(env, filterName) {
       if (env.WORKBUDDY_DOMAIN) session.auth.domain = env.WORKBUDDY_DOMAIN;
     }
     if (!session) {
-      throw new Error(
-        "NO_SESSION: 未配置登录凭据。请在 Worker 的 设置 → 变量和机密 中添加 Secret：" +
+      throw fail("CONFIG_ERROR",
+        "未配置登录凭据。请在 Worker 的 设置 → 变量和机密 中添加 Secret：" +
         "多账号用 WORKBUDDY_ACCOUNTS（JSON 数组）；单账号用 WORKBUDDY_SESSION（workbuddy-desktop.info 完整 JSON），" +
         "或分别添加 WORKBUDDY_TOKEN 与 WORKBUDDY_UID。"
       );
@@ -205,7 +217,7 @@ function resolveAccounts(env, filterName) {
   if (filterName) {
     const hit = accounts.filter((a) => a.name === filterName);
     if (!hit.length) {
-      throw new Error("NO_SESSION: 找不到名为「" + filterName + "」的账号；当前已配置：" + accounts.map((a) => a.name).join("、"));
+      throw fail("BAD_ACCOUNT", "找不到名为「" + filterName + "」的账号；当前已配置：" + accounts.map((a) => a.name).join("、"));
     }
     return hit;
   }
@@ -327,10 +339,12 @@ async function runGrowth(headers, endpoint) {
       const got = dig(c.body, "reward_credit");
       creditsGained += Number(got) || 0;
       parts.push("领旅行礼物 +" + fmtCredit(got) + " 积分");
+      travel = "idle"; // 仅在领取成功后变 idle，随后才会派新行程
     } else {
-      parts.push("领旅行礼物失败（HTTP " + c.status + "）");
+      // 领取失败时不要把状态当成 idle——否则会立刻派新行程，
+      // 等于白白丢掉这次已到站的礼物；保持 arrived，下次运行重试领取。
+      parts.push("领旅行礼物失败（HTTP " + c.status + "），本次不派新行程");
     }
-    travel = "idle"; // 领完后变 idle
   }
   if (travel === "idle") {
     const c = await get(base + "/buddy/travel/config", headers);
@@ -379,8 +393,10 @@ async function runGrowth(headers, endpoint) {
       if (done && task.accept_status !== "claimed" && task.has_reward) {
         const a = await post(base + "/tasks/accept", headers, { task_code: task.task_code });
         if (a.status >= 200 && a.status < 300) {
-          const rc = task.reward_credit || 0;
-          const re = task.reward_energy || 0;
+          // 用 Number() 归一：接口若把 reward_credit 返回成字符串，
+          // "0 + '100'" 会变成字符串拼接 "0100"，把累计积分整个带偏
+          const rc = Number(task.reward_credit) || 0;
+          const re = Number(task.reward_energy) || 0;
           creditsGained += rc;
           parts.push("领任务奖「" + (task.title || task.task_code) + "」+credit" + rc + "+energy" + re);
         }
@@ -513,9 +529,18 @@ async function runAuto(headers, endpoint) {
 
 // trigger：执行来源标记，写入日志便于区分（"cron" = 定时触发 / "http:<action>" = 手动访问）
 async function runOne(account, action, trigger) {
-  // 该账号自身配置非法（如 JSON 残缺、缺 token），直接返回失败、不发任何请求
+  // 该账号自身配置非法（如 JSON 残缺、缺 token），直接返回失败、不发任何请求。
+  // 用 CONFIG_ERROR 而非 NO_SESSION——这是配置问题，不该提示用户去重新登录。
   if (account.error) {
-    return { code: 1, out: { account: account.name, trigger: trigger, result: "NO_SESSION", report: "账号配置无效：" + account.error } };
+    return {
+      code: 1,
+      out: {
+        account: account.name,
+        trigger: trigger,
+        result: account.result || "CONFIG_ERROR",
+        report: "账号配置无效：" + account.error,
+      },
+    };
   }
   const { headers, endpoint, tokenInfo } = account;
 
@@ -587,7 +612,7 @@ async function runAction(env, action, trigger, filterName) {
   try {
     accounts = resolveAccounts(env, filterName);
   } catch (e) {
-    return { code: 1, out: { trigger: trigger, result: "NO_SESSION", report: String(e.message || e) } };
+    return { code: 1, out: { trigger: trigger, result: (e && e.result) || "ERROR", report: String(e.message || e) } };
   }
 
   const results = [];
@@ -613,24 +638,54 @@ async function runAction(env, action, trigger, filterName) {
 
 /* ---------- KV 运行日志 ---------- */
 
+// 每次运行写独立 key（signin:log:<北京时间>-<随机后缀>），而不是往同一个 key
+// 里 read-modify-write。原因：KV 是最终一致的，且同一 key 有 1 次写/秒的限制，
+// 定时任务与手动 /auto 撞在一起时，后写会整体覆盖前写，静默丢记录。
+// key 前缀是零填充的 ISO 时间，字典序 = 时间序，排序即可拿到倒序列表。
+const LOG_PREFIX = "signin:log:";
+const LOG_KEEP = 30;
+const LEGACY_LOG_KEY = "signin:history";
+
+// 列出全部日志 key，按时间倒序（新 → 旧）
+async function listLogKeys(env) {
+  const keys = [];
+  let cursor;
+  do {
+    const res = await env.KV.list({ prefix: LOG_PREFIX, cursor: cursor });
+    for (const k of res.keys) keys.push(k.name);
+    cursor = res.list_complete ? null : res.cursor;
+  } while (cursor);
+  return keys.sort().reverse();
+}
+
+// 只保留最近 LOG_KEEP 条，清掉更旧的（单条删除失败忽略，不影响本次运行）
+async function pruneLogs(env) {
+  try {
+    const keys = await listLogKeys(env);
+    for (const k of keys.slice(LOG_KEEP)) {
+      try {
+        await env.KV.delete(k);
+      } catch (e) { /* 清理是尽力而为 */ }
+    }
+  } catch (e) {
+    console.log("[workbuddy-signin] 清理旧日志失败：" + e);
+  }
+}
+
 async function saveLog(env, out) {
   if (!env.KV) return;
   // 北京时间（UTC+8），格式 yyyy-MM-dd HH:mm:ss，如 2026-09-01 08:00:42
   const d = new Date(Date.now() + 8 * 3600 * 1000);
   const p = (n) => String(n).padStart(2, "0");
-  const time = d.getUTCFullYear() + "-" + p(d.getUTCMonth() + 1) + "-" + p(d.getUTCDate()) +
-    " " + p(d.getUTCHours()) + ":" + p(d.getUTCMinutes()) + ":" + p(d.getUTCSeconds());
+  const stamp = d.getUTCFullYear() + "-" + p(d.getUTCMonth() + 1) + "-" + p(d.getUTCDate()) +
+    "T" + p(d.getUTCHours()) + ":" + p(d.getUTCMinutes()) + ":" + p(d.getUTCSeconds());
+  const time = stamp.replace("T", " ");
   const entry = { time: time, ...out };
+  // 加随机后缀：同一秒内的两次运行（如 cron 与手动同时）不会互相覆盖
+  const key = LOG_PREFIX + stamp + "-" + Math.random().toString(36).slice(2, 6);
   try {
-    let history = [];
-    try {
-      history = JSON.parse((await env.KV.get("signin:history")) || "[]");
-    } catch (e) {
-      history = [];
-    }
-    history.unshift(entry);
-    history = history.slice(0, 30);
-    await env.KV.put("signin:history", JSON.stringify(history));
+    await env.KV.put(key, JSON.stringify(entry));
+    await pruneLogs(env);
   } catch (e) {
     console.log("[workbuddy-signin] 写入 KV 日志失败：" + e);
   }
@@ -639,7 +694,19 @@ async function saveLog(env, out) {
 async function loadHistory(env) {
   if (!env.KV) return [];
   try {
-    return JSON.parse((await env.KV.get("signin:history")) || "[]");
+    const keys = await listLogKeys(env);
+    if (keys.length) {
+      const entries = await Promise.all(keys.slice(0, LOG_KEEP).map(async (k) => {
+        try {
+          return JSON.parse((await env.KV.get(k)) || "null");
+        } catch (e) {
+          return null;
+        }
+      }));
+      return entries.filter(Boolean);
+    }
+    // 兼容旧版单 key 记录（新格式还没有任何记录时才回退读取）
+    return JSON.parse((await env.KV.get(LEGACY_LOG_KEY)) || "[]");
   } catch (e) {
     return [];
   }
@@ -687,6 +754,8 @@ const RESULT_META = {
   INACTIVE: ["活动未开", "inactive"],
   TOKEN_EXPIRED: ["令牌过期", "token_expired"],
   NO_SESSION: ["登录失效", "no_session"],
+  CONFIG_ERROR: ["配置错误", "error"],
+  BAD_ACCOUNT: ["账号不存在", "error"],
   ERROR: ["错误", "error"],
   UNKNOWN: ["未知", "unknown"],
   PARTIAL_FAILED: ["部分失败", "partial_failed"],
@@ -928,6 +997,20 @@ function wantsHtml(request) {
   return (request.headers.get("accept") || "").includes("text/html");
 }
 
+// 失败结果的 HTTP 状态码：让调用方/监控能区分「客户端配置错」与「服务端异常」，
+// 而不是所有失败一律 500。未列出的结果保持 500。
+const HTTP_STATUS_BY_RESULT = {
+  CONFIG_ERROR: 400,
+  BAD_ACCOUNT: 400,
+  NO_SESSION: 401,
+  TOKEN_EXPIRED: 401,
+};
+
+function httpStatusFor(out, code) {
+  if (code === 0) return 200;
+  return HTTP_STATUS_BY_RESULT[(out && out.result) || ""] || 500;
+}
+
 // 可执行动作集合（日志走独立路由 /logs）
 const ACTION_PATHS = new Set(["auto", "growth", "status", "claim"]);
 
@@ -1027,7 +1110,8 @@ export default {
     const result = await runAction(env, action, "http:" + action, filterAccount);
     // 只有 auto / growth 写入运行日志；status / claim 为调试动作，避免刷屏淹没真正的签到记录
     if (action === "auto" || action === "growth") await saveLog(env, result.out);
-    if (asHtml) return htmlResponse(renderResult(result.out, action, keyPart), result.code === 0 ? 200 : 500);
-    return jsonResponse(result.out, result.code === 0 ? 200 : 500);
+    const status = httpStatusFor(result.out, result.code);
+    if (asHtml) return htmlResponse(renderResult(result.out, action, keyPart), status);
+    return jsonResponse(result.out, status);
   },
 };

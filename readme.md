@@ -149,7 +149,7 @@ https://<你的worker域名>/status
 - 配置 `WORKBUDDY_ACCOUNTS` 后，单账号的 `WORKBUDDY_SESSION` / `WORKBUDDY_TOKEN` 会被忽略；改回单账号直接删掉本变量即可。
 - 只想手动调试某一个账号：URL 加 `?account=账号名`，例如 `/auto?account=主号`。
 
-> 升级提示：旧版 KV 里的历史日志无需清理，新版页面可以直接渲染老格式记录。
+> 升级提示：运行记录改为**每次运行写一个独立 key**（避免定时任务与手动触发并发时互相覆盖），写入后自动裁剪为最近 30 条。旧版单 key 的历史日志无需手动清理，在新记录产生前仍会被正常渲染。
 
 ## 配置每日定时（Cron 触发器）
 
@@ -252,8 +252,12 @@ Worker 的默认域名是公开的，任何人知道 URL 都能触发签到。�
 | `PARTIAL_FAILED` | 多账号中部分账号失败，其余正常 | 看 `accounts` 里标红的账号 |
 | `FAILED` | 多账号全部失败 | 全部需要更新凭据或排查 |
 | `TOKEN_EXPIRED` | 该账号登录令牌已过期（签到大概率已失败） | 重新登录该账号桌面端 → 更新 `WORKBUDDY_ACCOUNTS` 中对应项 → 重新部署 |
-| `NO_SESSION` | 未配置凭据 / 登录态已失效 / 账号配置非法 | 同上 |
+| `NO_SESSION` | 登录态已失效（接口返回 401 / 403） | 同上 |
+| `CONFIG_ERROR` | 凭据没配好：未配置任何账号、JSON 格式错、`session` 里缺 accessToken 或 uid | 检查 Secret 内容与格式，不用重新登录 |
+| `BAD_ACCOUNT` | `?account=账号名` 指定的账号不存在 | 按首页列出的账号名重试 |
 | `ERROR` / `UNKNOWN` | 接口返回异常，JSON 里附带原始响应 | 看 `report` 与 `claim_body` 字段定位 |
+
+调用失败时返回的 HTTP 状态码：`CONFIG_ERROR` / `BAD_ACCOUNT` → 400，`NO_SESSION` / `TOKEN_EXPIRED` → 401，其余失败 → 500；成功一律 200。这样接监控时能一眼区分"是我配置错了"还是"上游出问题了"。
 
 其余通用字段：
 
