@@ -805,6 +805,17 @@ pre{white-space:pre-wrap;word-break:break-all;background:#fff;border:1px solid #
 details{margin-top:8px;} summary{cursor:pointer;color:#6B7280;font-size:12.5px;}
 .btnrow a{display:inline-block;padding:6px 14px;border:1px solid #CFDADF;background:#fff;border-radius:999px;font-size:13px;margin:0 8px 8px 0;}
 .warn{border-color:rgba(234,102,104,.45);}
+/* 移动端：日志表格转卡片布局（<640px 时每行一张卡，td 前置列名标签） */
+@media (max-width:640px){
+  .tbl-scroll{overflow-x:visible;}
+  .logtbl{display:block;border:none;background:transparent;}
+  .logtbl thead{display:none;}
+  .logtbl tbody{display:block;}
+  .logtbl tr{display:block;background:#fff;border:1px solid #E4E3DD;border-radius:12px;margin:10px 0;}
+  .logtbl td{display:block;border-top:none;padding:5px 14px;}
+  .logtbl td + td{border-top:1px dashed #F0EFEA;}
+  .logtbl td[data-label]::before{content:attr(data-label);display:inline-block;min-width:4.5em;color:#6B7280;font-size:12px;}
+}
 `;
 
 function pageShell(title, inner, autoRefresh) {
@@ -887,13 +898,13 @@ function renderLogList(history, keyPart) {
         const note = o.report || debugBrief(o) || "";
         let row = "<tr>";
         if (j === 0) {
-          row += '<td rowspan="' + lines.length + '" style="white-space:nowrap;color:#6B7280;font-size:12px;">' +
+          row += '<td data-label="时间(北京)" rowspan="' + lines.length + '" style="white-space:nowrap;color:#6B7280;font-size:12px;">' +
             escapeHtml(e.time) + "<br>" + escapeHtml(triggerLabel(e.trigger)) + "</td>";
         }
-        row += '<td><span class="badge b-' + b.cls + '">' + escapeHtml(b.label) + "</span></td>";
+        row += '<td data-label="结果"><span class="badge b-' + b.cls + '">' + escapeHtml(b.label) + "</span></td>";
         const accLabel = o.account && o.account !== "default" ? o.account : "—";
-        row += '<td style="white-space:nowrap;">' + escapeHtml(accLabel) + "</td>";
-        row += '<td style="color:#374151;">' + escapeHtml(truncate(note, 120)) + "</td>";
+        row += '<td data-label="账号" style="white-space:nowrap;">' + escapeHtml(accLabel) + "</td>";
+        row += '<td data-label="说明" style="color:#374151;">' + escapeHtml(truncate(note, 120)) + "</td>";
         if (j === 0) {
           row += '<td rowspan="' + lines.length + '" style="white-space:nowrap;"><a href="' + linkQ("logs", keyPart, "i=" + idx) + '">详情</a></td>';
         }
@@ -908,7 +919,7 @@ function renderLogList(history, keyPart) {
     '<span class="sub">最近 ' + history.length + ' 条运行记录 · 每 60 秒自动刷新 · 仅保留最近 30 次</span></div>' +
     toolbar(keyPart) +
     "<hr>" +
-    '<div class="tbl-scroll"><table><thead><tr>' +
+    '<div class="tbl-scroll"><table class="logtbl"><thead><tr>' +
     "<th>时间(北京)</th><th>结果</th><th>账号</th><th>说明</th><th></th>" +
     "</tr></thead><tbody>" + rows + "</tbody></table></div>";
   return pageShell("WorkBuddy 签到日志", inner, true);
