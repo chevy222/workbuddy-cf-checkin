@@ -50,6 +50,13 @@
  *   - 手动触发：浏览器访问 https://<worker域名>/auto （或 /growth /status /claim /logs）
  */
 
+/* ---------- 页面展示的构建版本 ---------- */
+
+// 日期（yyyymmdd）+ 当天第几次改动。每次改动代码后手动把冒号后的序号 +1；
+// 跨天则换成当天日期、序号从 1 重新开始。页脚会显示它——配合自动部署时，
+// 刷新页面看这一行变没变，就知道新版本上线没有。
+const BUILD_VERSION = "20260912:1";
+
 const DEFAULT_ENDPOINT = "https://copilot.tencent.com";
 
 /* ---------- HTTP 基础（对应 Python 的 _request/post/get） ---------- */
@@ -835,7 +842,7 @@ function pageShell(title, inner, autoRefresh) {
     (autoRefresh ? '<meta http-equiv="refresh" content="60">' : "") +
     "<title>" + escapeHtml(title) + "</title><style>" + PAGE_CSS + "</style></head>" +
     '<body><div class="wrap">' + inner +
-    '<footer style="text-align:center;margin-top:18px;font-size:12px;color:#8A919C;">Powered by <a href="https://github.com/chevy222/workbuddy-cf-checkin" target="_blank" rel="noopener">Github</a></footer>' +
+    '<footer style="text-align:center;margin-top:18px;font-size:12px;color:#8A919C;">Powered by <a href="https://github.com/chevy222/workbuddy-cf-checkin" target="_blank" rel="noopener">Github</a><br><span style="color:#A8AEB8;">version ' + escapeHtml(BUILD_VERSION) + '</span></footer>' +
     '</div></body></html>';
 }
 
