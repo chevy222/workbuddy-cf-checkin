@@ -55,7 +55,7 @@
 // 日期（yyyymmdd）+ 当天第几次改动。当天第几个改动就写几；
 // 跨天则换成当天日期、序号从 1 重新开始。页脚会显示它——配合自动部署时，
 // 刷新页面看这一行变没变，就知道新版本上线没有。
-const BUILD_VERSION = "20260912:1";
+const BUILD_VERSION = "20260912:2";
 
 const DEFAULT_ENDPOINT = "https://copilot.tencent.com";
 
@@ -154,7 +154,7 @@ function buildAccount(conf, index, env) {
   const tokenInfo = inspectToken(session.auth.accessToken);
   const acc = (session.account || {});
   const fallbackName = acc.nickname || acc.name || ("账号" + (index + 1));
-  return { name: conf.name ? String(conf.name) : String(fallbackName), headers, endpoint, tokenInfo };
+  return { name: conf.name ? String(conf.name) : String(fallbackName), uid: String(acc.uid || ""), headers, endpoint, tokenInfo };
 }
 
 // 解析出本次要执行的账号列表；配置非法时抛错，单个账号非法时该账号带 error 字段，不影响其他账号
@@ -535,7 +535,7 @@ async function runAuto(headers, endpoint) {
 /* ---------- 动作调度：单账号执行 + 多账号聚合 ---------- */
 
 // trigger：执行来源标记，写入日志便于区分（"cron" = 定时触发 / "http:<action>" = 手动访问）
-async function runOne(account, action, trigger) {
+async function runOne(account, action, trigger, env) {
   // 该账号自身配置非法（如 JSON 残缺、缺 token），直接返回失败、不发任何请求。
   // 用 CONFIG_ERROR 而非 NO_SESSION——这是配置问题，不该提示用户去重新登录。
   if (account.error) {
@@ -551,44 +551,63 @@ async function runOne(account, action, trigger) {
   }
   const { headers, endpoint, tokenInfo } = account;
 
-  let r;
-  switch (action) {
-    case "auto": {
-      r = await runAuto(headers, endpoint);
-      // 仅当签到链路正常（CLAIMED / ALREADY / INACTIVE，code===0）时才顺带跑成长中心；
-      // 登录失效或接口异常（code!==0）时直接返回，避免用失效登录态白打一串成长中心请求
-      if (r.code === 0) {
-        const g = await runGrowth(headers, endpoint);
-        r.out.growth = g.out.report;
-        if (g.out.credits_gained) r.out.report += "；" + g.out.report;
+  // —— 乐观并发锁（与 trae 版同机制）——
+  // 拿不到 KV 或 KV 报错时不拦主流程：锁只是"尽力而为"的并发保护。
+  const lockKey = account.uid ? LOCK_PREFIX + account.uid : "";
+  const kv = env && env.KV;
+  if (lockKey && kv) {
+    try {
+      if (await kv.get(lockKey)) {
+        return { code: 0, out: { account: account.name, trigger: trigger, result: "SKIPPED", report: "已有运行在途，跳过（并发保护）" } };
       }
-      break;
-    }
-    case "growth":
-      r = await runGrowth(headers, endpoint);
-      break;
-    case "status": {
-      const s = await post(endpoint + "/v2/billing/meter/checkin-activity-status", headers);
-      r = { code: 0, out: { step: "status", http: s.status, body: s.body } };
-      break;
-    }
-    case "claim": {
-      const c = await post(endpoint + "/v2/billing/meter/daily-checkin", headers);
-      r = { code: 0, out: { step: "claim", http: c.status, body: c.body } };
-      break;
-    }
-    default:
-      return { code: 2, out: { account: account.name, trigger: trigger, result: "BAD_ACTION", report: "未知 action：" + action + "（可选 auto/growth/status/claim）" } };
+      await kv.put(lockKey, String(Date.now()), { expirationTtl: LOCK_TTL });
+    } catch (e) { /* 锁不可用时不影响正常执行 */ }
   }
 
-  // 附上账号名、执行来源与令牌到期预警
-  r.out.account = account.name;
-  r.out.trigger = trigger;
-  r.out = applyTokenWarning(r.out, tokenInfo);
-  return r;
+  try {
+    let r;
+    switch (action) {
+      case "auto": {
+        r = await runAuto(headers, endpoint);
+        // 仅当签到链路正常（CLAIMED / ALREADY / INACTIVE，code===0）时才顺带跑成长中心；
+        // 登录失效或接口异常（code!==0）时直接返回，避免用失效登录态白打一串成长中心请求
+        if (r.code === 0) {
+          const g = await runGrowth(headers, endpoint);
+          r.out.growth = g.out.report;
+          if (g.out.credits_gained) r.out.report += "；" + g.out.report;
+        }
+        break;
+      }
+      case "growth":
+        r = await runGrowth(headers, endpoint);
+        break;
+      case "status": {
+        const s = await post(endpoint + "/v2/billing/meter/checkin-activity-status", headers);
+        r = { code: 0, out: { step: "status", http: s.status, body: s.body } };
+        break;
+      }
+      case "claim": {
+        const c = await post(endpoint + "/v2/billing/meter/daily-checkin", headers);
+        r = { code: 0, out: { step: "claim", http: c.status, body: c.body } };
+        break;
+      }
+      default:
+        return { code: 2, out: { account: account.name, trigger: trigger, result: "BAD_ACTION", report: "未知 action：" + action + "（可选 auto/growth/status/claim）" } };
+    }
+
+    // 附上账号名、执行来源与令牌到期预警
+    r.out.account = account.name;
+    r.out.trigger = trigger;
+    r.out = applyTokenWarning(r.out, tokenInfo);
+    return r;
+  } finally {
+    if (lockKey && kv) {
+      try { await kv.delete(lockKey); } catch (e) { /* 释放失败就等 TTL 自动过期 */ }
+    }
+  }
 }
 
-const GOOD_RESULTS = new Set(["CLAIMED", "ALREADY", "INACTIVE", "GROWTH", "OK"]);
+const GOOD_RESULTS = new Set(["CLAIMED", "ALREADY", "INACTIVE", "GROWTH", "OK", "SKIPPED"]);
 
 // status/claim 等调试动作的输出没有 result 字段，聚合时按其 HTTP 状态归一：
 // 2xx/3xx 算 OK，4xx/5xx/网络异常(-1) 算 ERROR，避免顶层 result 变成 undefined
@@ -624,7 +643,7 @@ async function runAction(env, action, trigger, filterName) {
 
   const results = [];
   for (const acc of accounts) {
-    results.push(await runOne(acc, action, trigger));
+    results.push(await runOne(acc, action, trigger, env));
   }
 
   if (results.length === 1) return results[0];
@@ -655,6 +674,10 @@ const LEGACY_LOG_KEY = "signin:history";
 // Cron 心跳：只由 scheduled() 写。用途是证明「定时任务真的被调度到过」，
 // 并把 Cloudflare 实际使用的表达式记下来供核对——不受日志裁剪影响。
 const CRON_KEY = "signin:cron:last";
+// 乐观并发锁（对齐 trae 版的 lock:<uid>）：KV 无 CAS，尽力而为，TTL 自动回收。
+// 防止 cron 与手动 /auto 同时触发时，对同一账号并行请求上游。
+const LOCK_PREFIX = "signin:lock:";
+const LOCK_TTL = 90; // 秒
 
 // 列出全部日志 key，按时间倒序（新 → 旧）
 async function listLogKeys(env) {
@@ -727,14 +750,15 @@ async function loadHistory(env) {
 function jsonResponse(obj, status = 200) {
   return new Response(JSON.stringify(obj, null, 2), {
     status: status,
-    headers: { "Content-Type": "application/json; charset=utf-8" },
+    // 这些接口返回的都是实时状态，缓存住会让人误判（如刷新页面看不到最新 version / 日志）
+    headers: { "Content-Type": "application/json; charset=utf-8", "Cache-Control": "no-store" },
   });
 }
 
 function htmlResponse(html, status = 200) {
   return new Response(html, {
     status: status,
-    headers: { "Content-Type": "text/html; charset=utf-8" },
+    headers: { "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store" },
   });
 }
 
@@ -770,6 +794,7 @@ const RESULT_META = {
   ALREADY: ["已签到", "already"],
   GROWTH: ["成长中心", "growth"],
   INACTIVE: ["活动未开", "inactive"],
+  SKIPPED: ["并发跳过", "inactive"],
   TOKEN_EXPIRED: ["令牌过期", "token_expired"],
   NO_SESSION: ["登录失效", "no_session"],
   CONFIG_ERROR: ["配置错误", "error"],
@@ -986,7 +1011,8 @@ async function renderHome(env, keyPart) {
   }
   const cronBlock = hb && hb.ts
     ? '<div class="card"><div class="accname">定时任务（Cron）</div>' +
-      '<div class="report" style="color:#2F6B12;">上次触发：' + escapeHtml(fmtCN(hb.ts)) + "</div>" +
+      // 心跳里存的是「秒」（与 trae 版统一），fmtCN 收毫秒，这里换算一次
+      '<div class="report" style="color:#2F6B12;">上次触发：' + escapeHtml(fmtCN(Number(hb.ts) * 1000)) + "</div>" +
       '<div class="meta">Cloudflare 使用的表达式：<code>' + escapeHtml(hb.cron || "未提供") + "</code></div></div>"
     : '<div class="card warn"><div class="accname">定时任务（Cron）</div>' +
       '<div class="report" style="color:#B03A3C;">尚无触发记录</div>' +
@@ -1088,9 +1114,14 @@ export default {
     const planMs = Number((event && event.scheduledTime) || Date.now());
     console.log("[workbuddy-signin] cron 已触发 " + cronExpr);
     // 心跳：进 scheduled 的第一件事就把「我来过」落盘，不依赖后续任何逻辑。
+    // ts / plan_at 一律存「秒」，与 trae 版保持一致（那边同样是秒），避免两脚本单位不同踩坑。
     if (env.KV) {
       try {
-        await env.KV.put(CRON_KEY, JSON.stringify({ ts: Date.now(), cron: cronExpr, plan_at: planMs }));
+        await env.KV.put(CRON_KEY, JSON.stringify({
+          ts: Math.floor(Date.now() / 1000),
+          cron: cronExpr,
+          plan_at: Math.floor(planMs / 1000),
+        }));
       } catch (e) {
         console.error("[workbuddy-signin] cron 心跳写入失败：" + (e && e.message));
       }
