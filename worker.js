@@ -645,6 +645,9 @@ async function runAction(env, action, trigger, filterName) {
 const LOG_PREFIX = "signin:log:";
 const LOG_KEEP = 30;
 const LEGACY_LOG_KEY = "signin:history";
+// Cron 心跳：只由 scheduled() 写。用途是证明「定时任务真的被调度到过」，
+// 并把 Cloudflare 实际使用的表达式记下来供核对——不受日志裁剪影响。
+const CRON_KEY = "signin:cron:last";
 
 // 列出全部日志 key，按时间倒序（新 → 旧）
 async function listLogKeys(env) {
@@ -673,16 +676,16 @@ async function pruneLogs(env) {
 }
 
 async function saveLog(env, out) {
-  if (!env.KV) return;
+  if (!env.KV) {
+    // 直接 return 会让「没绑 KV」和「根本没触发」在日志上无法区分，留一行实时日志
+    console.log("[workbuddy-signin] 未绑定 KV 命名空间，跳过写入运行日志");
+    return;
+  }
   // 北京时间（UTC+8），格式 yyyy-MM-dd HH:mm:ss，如 2026-09-01 08:00:42
-  const d = new Date(Date.now() + 8 * 3600 * 1000);
-  const p = (n) => String(n).padStart(2, "0");
-  const stamp = d.getUTCFullYear() + "-" + p(d.getUTCMonth() + 1) + "-" + p(d.getUTCDate()) +
-    "T" + p(d.getUTCHours()) + ":" + p(d.getUTCMinutes()) + ":" + p(d.getUTCSeconds());
-  const time = stamp.replace("T", " ");
+  const time = fmtCN(Date.now());
   const entry = { time: time, ...out };
   // 加随机后缀：同一秒内的两次运行（如 cron 与手动同时）不会互相覆盖
-  const key = LOG_PREFIX + stamp + "-" + Math.random().toString(36).slice(2, 6);
+  const key = LOG_PREFIX + time.replace(" ", "T") + "-" + Math.random().toString(36).slice(2, 6);
   try {
     await env.KV.put(key, JSON.stringify(entry));
     await pruneLogs(env);
@@ -737,6 +740,14 @@ function escapeHtml(v) {
 function truncate(s, n) {
   s = String(s == null ? "" : s).replace(/\s+/g, " ");
   return s.length > n ? s.slice(0, n) + "…" : s;
+}
+
+// 北京时间（UTC+8）格式化，形如 2026-09-12 14:58:30
+function fmtCN(ms) {
+  const d = new Date(Number(ms) + 8 * 3600 * 1000);
+  const p = (n) => String(n).padStart(2, "0");
+  return d.getUTCFullYear() + "-" + p(d.getUTCMonth() + 1) + "-" + p(d.getUTCDate()) +
+    " " + p(d.getUTCHours()) + ":" + p(d.getUTCMinutes()) + ":" + p(d.getUTCSeconds());
 }
 
 function triggerLabel(t) {
@@ -960,7 +971,20 @@ function renderResult(out, action, keyPart) {
 }
 
 // 裸访问首页
-function renderHome(env, keyPart) {
+async function renderHome(env, keyPart) {
+  // 定时任务心跳卡：一眼看出「cron 到底有没有来过」，不依赖账号是否配置、也不依赖当时是否在看实时日志
+  let hb = null;
+  if (env.KV) {
+    try { hb = JSON.parse((await env.KV.get(CRON_KEY)) || "null"); } catch (e) { hb = null; }
+  }
+  const cronBlock = hb && hb.ts
+    ? '<div class="card"><div class="accname">定时任务（Cron）</div>' +
+      '<div class="report" style="color:#2F6B12;">上次触发：' + escapeHtml(fmtCN(hb.ts)) + "</div>" +
+      '<div class="meta">Cloudflare 使用的表达式：<code>' + escapeHtml(hb.cron || "未提供") + "</code></div></div>"
+    : '<div class="card warn"><div class="accname">定时任务（Cron）</div>' +
+      '<div class="report" style="color:#B03A3C;">尚无触发记录</div>' +
+      '<div class="meta">若面板上已配置 Cron 触发器、此卡却长期为空，说明定时任务没有被调度到（需查触发器配置与域名绑定的 Worker）。本卡需要已绑定 KV。</div></div>';
+
   let accBlock;
   try {
     const accs = resolveAccounts(env);
@@ -992,6 +1016,7 @@ function renderHome(env, keyPart) {
 
   const inner =
     '<div class="hd"><h2>WorkBuddy 签到 Worker</h2><span class="sub">云端自动签到 · 幂等可重复执行</span></div>' +
+    cronBlock +
     accBlock +
     '<div class="btnrow" style="margin-top:6px;">' +
       '<a href="' + linkQ("auto", keyPart) + '">▶ 立即签到</a>' +
@@ -1047,9 +1072,31 @@ function parseRoute(url) {
 
 export default {
   // 定时任务：每天自动签到 + 成长中心（对应 Python 的 auto 模式 + 计划任务；多账号全部执行）
+  // 入口先打一行实时日志：Cloudflare 的实时日志不依赖 KV，判断「触发器有没有被调用」看它最直接。
+  // 另加 try/catch 兜底：runAction 抛错时也要留一条记录，否则 cron 异常会完全静默、无法与「没触发」区分。
   async scheduled(event, env, ctx) {
-    const result = await runAction(env, "auto", "cron");
-    console.log("[workbuddy-signin] " + JSON.stringify(result.out, null, 2));
+    // event 由 Cloudflare 传入，带着「实际使用的 cron 表达式」和「计划触发时间」，
+    // 记下来才能核对面板上配的表达式是否真的生效（之前这两个值是被丢掉的）。
+    const cronExpr = String((event && event.cron) || "");
+    const planMs = Number((event && event.scheduledTime) || Date.now());
+    console.log("[workbuddy-signin] cron 已触发 " + cronExpr);
+    // 心跳：进 scheduled 的第一件事就把「我来过」落盘，不依赖后续任何逻辑。
+    if (env.KV) {
+      try {
+        await env.KV.put(CRON_KEY, JSON.stringify({ ts: Date.now(), cron: cronExpr, plan_at: planMs }));
+      } catch (e) {
+        console.error("[workbuddy-signin] cron 心跳写入失败：" + (e && e.message));
+      }
+    }
+    let result = null;
+    try {
+      result = await runAction(env, "auto", "cron");
+      console.log("[workbuddy-signin] " + JSON.stringify(result.out, null, 2));
+    } catch (e) {
+      const msg = String((e && e.message) || e);
+      console.error("[workbuddy-signin] cron 执行失败：" + msg);
+      result = { code: 1, out: { result: "ERROR", report: "定时任务执行异常：" + msg, trigger: "cron" } };
+    }
     await saveLog(env, result.out);
   },
 
@@ -1092,7 +1139,7 @@ export default {
     // （公网域名会被扫描器频繁访问，若默认执行 auto，每次扫描都会
     //   白跑一遍签到流程并写一条日志）
     if (route.kind === "home") {
-      if (asHtml) return htmlResponse(renderHome(env, keyPart));
+      if (asHtml) return htmlResponse(await renderHome(env, keyPart));
       return jsonResponse({
         result: "OK",
         report: "WorkBuddy 签到 Worker 运行中。路径：/auto（签到+成长中心）、/growth、/status、/claim、/logs（运行日志）；浏览器访问为可视化页面，旧版 JSON 输出形态仍兼容。",
