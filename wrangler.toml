@@ -1,0 +1,11 @@
+name = "workbuddy"
+main = "worker.js"
+compatibility_date = "2026-09-12"
+keep_vars = true
+
+[triggers]
+crons = ["0 0 * * *"]
+
+[[kv_namespaces]]
+binding = "KV"
+id = "b35152acdb1d4083b23f6483e82be74c"
