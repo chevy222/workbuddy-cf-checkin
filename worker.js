@@ -55,7 +55,7 @@
 // 日期（yyyymmdd）+ 当天第几次改动。当天第几个改动就写几；
 // 跨天则换成当天日期、序号从 1 重新开始。页脚会显示它——配合自动部署时，
 // 刷新页面看这一行变没变，就知道新版本上线没有。
-const BUILD_VERSION = "20260912:2";
+const BUILD_VERSION = "20260913:1";
 
 const DEFAULT_ENDPOINT = "https://copilot.tencent.com";
 
@@ -959,7 +959,7 @@ function renderLogList(history, keyPart) {
 
   const inner =
     '<div class="hd"><h2>WorkBuddy 签到运行日志</h2>' +
-    '<span class="sub">最近 ' + history.length + ' 条运行记录 · 每 60 秒自动刷新 · 仅保留最近 30 次</span></div>' +
+    '<span class="sub">最近 ' + history.length + ' 条 · 每 60 秒自动刷新 · 仅保留 30 次</span></div>' +
     toolbar(keyPart) +
     "<hr>" +
     '<div class="tbl-scroll"><table class="logtbl"><thead><tr>' +
@@ -971,7 +971,7 @@ function renderLogList(history, keyPart) {
 // 日志详情页
 function renderDetail(history, i, keyPart) {
   const e = history[i];
-  let inner = toolbar(keyPart);
+  let inner = '<div class="hd"><h2>WorkBuddy 签到日志详情</h2><span class="sub">单条运行记录 · 仅保留最近 30 次</span></div>' + toolbar(keyPart);
   if (!e) {
     inner += '<div class="card sub">记录不存在（可能已被新记录挤出，仅保留最近 30 次运行）。</div>';
   } else {
@@ -1011,9 +1011,9 @@ async function renderHome(env, keyPart) {
   }
   const cronBlock = hb && hb.ts
     ? '<div class="card"><div class="accname">定时任务（Cron）</div>' +
-      // 心跳里存的是「秒」（与 trae 版统一），fmtCN 收毫秒，这里换算一次
-      '<div class="report" style="color:#2F6B12;">上次触发：' + escapeHtml(fmtCN(Number(hb.ts) * 1000)) + "</div>" +
-      '<div class="meta">Cloudflare 使用的表达式：<code>' + escapeHtml(hb.cron || "未提供") + "</code></div></div>"
+      // 心跳里存的是「秒」（与 trae 版统一），fmtCN 收毫秒，这里换算一次。
+      // 卡片只显示上次触发时间（与 trae 版统一）；Cloudflare 实际使用的表达式仍记录在 KV 心跳里
+      '<div class="report" style="color:#2F6B12;">上次触发：' + escapeHtml(fmtCN(Number(hb.ts) * 1000)) + "</div></div>"
     : '<div class="card warn"><div class="accname">定时任务（Cron）</div>' +
       '<div class="report" style="color:#B03A3C;">尚无触发记录</div>' +
       '<div class="meta">若面板上已配置 Cron 触发器、此卡却长期为空，说明定时任务没有被调度到（需查触发器配置与域名绑定的 Worker）。本卡需要已绑定 KV。</div></div>';
