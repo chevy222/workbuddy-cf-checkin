@@ -55,7 +55,7 @@
 // 日期（yyyymmdd）+ 当天第几次改动。当天第几个改动就写几；
 // 跨天则换成当天日期、序号从 1 重新开始。页脚会显示它——配合自动部署时，
 // 刷新页面看这一行变没变，就知道新版本上线没有。
-const BUILD_VERSION = "20260925:1";
+const BUILD_VERSION = "20260925:2";
 
 const DEFAULT_ENDPOINT = "https://copilot.tencent.com";
 
@@ -103,10 +103,18 @@ function fail(result, message) {
   return e;
 }
 
+// 新版桌面端把 accessToken / refreshToken 包成了 {"$wbEncrypted":1,"envelope":"实际token"}，
+// 旧版是纯字符串。这里统一解包：字符串直接返回，对象取 envelope。
+function unwrapToken(val) {
+  if (typeof val === "string") return val;
+  if (val && typeof val === "object" && typeof val.envelope === "string") return val.envelope;
+  return val;
+}
+
 function buildHeaders(session) {
   const auth = (session && session.auth) || {};
   const account = (session && session.account) || {};
-  const token = auth.accessToken;
+  const token = unwrapToken(auth.accessToken);
   const uid = account.uid;
   if (!token || !uid) {
     throw fail("CONFIG_ERROR", "会话凭据中缺少 accessToken 或 uid");
@@ -152,11 +160,11 @@ function buildAccount(conf, index, env) {
 
   const headers = buildHeaders(session); // 缺 token/uid 时在此抛错
   const endpoint = ((session.auth || {}).endpoint || conf.endpoint || env.WORKBUDDY_ENDPOINT || DEFAULT_ENDPOINT).replace(/\/+$/, "");
-  const tokenInfo = inspectToken(session.auth.accessToken);
+  const tokenInfo = inspectToken(unwrapToken(session.auth.accessToken));
   const acc = (session.account || {});
   const fallbackName = acc.nickname || acc.name || ("账号" + (index + 1));
-  // refreshToken 来自 session（info 文件自带 auth.refreshToken）或 conf.refresh_token
-  const refreshToken = (session.auth && session.auth.refreshToken) || null;
+  // refreshToken 来自 session（info 文件自带 auth.refreshToken）或 conf.refresh_token；新版可能是包装对象，需解包
+  const refreshToken = unwrapToken((session.auth && session.auth.refreshToken) || conf.refresh_token) || null;
   return {
     name: conf.name ? String(conf.name) : String(fallbackName),
     uid: String(acc.uid || ""),
@@ -501,18 +509,23 @@ async function runGrowth(headers, endpoint) {
     }
   }
   if (travel === "idle") {
-    const c = await get(base + "/buddy/travel/config", headers);
-    const locs = c.status >= 200 && c.status < 300 ? dig(c.body, "locations") : null;
-    if (locs && locs.length) {
-      const loc = locs[0];
-      const d = await post(base + "/buddy/travel/depart", headers, { location_id: loc.id });
-      if (d.status >= 200 && d.status < 300) {
-        const locName = (dig(d.body, "location") || {}).name || "?";
-        const dur = dig(d.body, "duration_hours") || (dig(d.body, "location") || {}).duration_hours || "?";
-        parts.push("派 Buddy 去" + locName + "（" + dur + " 小时后回）");
-      } else {
-        const msg = dig(d.body, "msg") || "";
-        parts.push("派 Buddy 失败：" + (msg || "HTTP " + d.status));
+    // 今日出行次数已达上限时不尝试出发，避免白打请求拿到 "daily limit reached"
+    if (dig(s.body, "daily_limit_reached")) {
+      parts.push("Buddy 今日旅行次数已用尽");
+    } else {
+      const c = await get(base + "/buddy/travel/config", headers);
+      const locs = c.status >= 200 && c.status < 300 ? dig(c.body, "locations") : null;
+      if (locs && locs.length) {
+        const loc = locs[0];
+        const d = await post(base + "/buddy/travel/depart", headers, { location_id: loc.id });
+        if (d.status >= 200 && d.status < 300) {
+          const locName = (dig(d.body, "location") || {}).name || "?";
+          const dur = dig(d.body, "duration_hours") || (dig(d.body, "location") || {}).duration_hours || "?";
+          parts.push("派 Buddy 去" + locName + "（" + dur + " 小时后回）");
+        } else {
+          const msg = dig(d.body, "msg") || "";
+          parts.push("派 Buddy 失败：" + (msg || "HTTP " + d.status));
+        }
       }
     }
   } else if (travel === "traveling") {
