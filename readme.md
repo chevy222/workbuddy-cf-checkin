@@ -3,7 +3,8 @@
 部署到 Cloudflare Workers 后，**不需要开机、不需要本地运行任何程序**，每天定时自动完成：
 
 - 每日积分签到（幂等，签过不会重复领）
-- 成长中心全套：领 Buddy 旅行礼物 → 派 Buddy 出发旅行 → 开盲盒 → 领任务奖励
+- 成长中心全套：领 Buddy 旅行礼物 → 派 Buddy 出发旅行 → 抽奖 → 开盲盒（消耗能量）→ 领任务奖励 → 连签档位兑换
+- **Token 自动续期**：配置 Refresh Token 后自动刷新，90 天滚动续期，基本不用再手动更新凭据
 - 能量 / 连签天数查询汇总
 - **多账号**：一个 Worker 同时托管多个 WorkBuddy 账号，定时任务依次跑完、汇总成一条记录
 - **定时任务心跳**：首页显示上次 Cron 触发时间，"到点了没跑"一眼可查
@@ -27,6 +28,9 @@
 - [配置每日定时（Cron 触发器）](#配置每日定时cron-触发器)
 - [手动触发、页面与调试](#手动触发页面与调试)
 - [可选功能](#可选功能)
+  - [访问密钥](#访问密钥防止别人乱触发你的-worker)
+  - [KV 日志](#kv-日志云端保存运行记录--日志页面)
+  - [Token 自动续期（Refresh Token）](#token-自动续期refresh-token)
 - [运行结果说明](#运行结果说明)
 - [常见问题排查](#常见问题排查)
 - [安全须知](#安全须知)
@@ -45,10 +49,14 @@
 ```
 POST {endpoint}/v2/billing/meter/checkin-activity-status   查询签到状态
 POST {endpoint}/v2/billing/meter/daily-checkin             领取今日积分
-GET  {endpoint}/v2/activity/growth/...                     成长中心（旅行/盲盒/任务/能量/连签）
+GET  {endpoint}/v2/activity/growth/...                     成长中心（旅行/抽奖/盲盒/任务/能量/连签）
+POST {endpoint}/v2/activity/growth/redeem                  连签档位兑换（7d/14d/28d）
+POST {endpoint}/v2/plugin/auth/token/refresh               Token 自动续期（用 RT 换新 AT+RT）
 ```
 
 默认 `endpoint` 为 `https://copilot.tencent.com`。
+
+**Token 自动续期**：配置了 Refresh Token（RT）的账号，脚本会在 AT 临期（剩余 7 天内）或距上次刷新超过 10 天时自动调用刷新接口，用 RT 换取新的 AT + RT，并将新 RT 存入 KV（`signin:rt:<uid>`），形成滚动续期。环境变量里的初始凭据与 KV 里的刷新记录以 AT 的过期时间（exp）比较，谁更新用谁的。续期需要绑定 KV 命名空间。
 
 接口响应契约：
 
@@ -111,6 +119,8 @@ C:\Users\<你的用户名>\AppData\Local\CodeBuddyExtension\Data\Public\auth\wor
 
 企业账号可再加 `WORKBUDDY_ENTERPRISE_ID`；两种方案二选一，同时配置时以 `WORKBUDDY_SESSION` 优先。
 
+> 如需启用 **Token 自动续期**，简化方案还需再加一个 Secret `WORKBUDDY_REFRESH_TOKEN`（值为凭据文件里 `auth.refreshToken`）。用完整 `WORKBUDDY_SESSION` 方案时无需额外配置，文件里自带 RT。
+
 ### 3. 验证
 
 浏览器访问（Worker 的域名在概览页可以看到）：
@@ -135,6 +145,7 @@ https://<你的worker域名>/status
     "name": "小号",
     "token": "该账号 auth.accessToken 的值",
     "uid": "该账号 account.uid 的值",
+    "refresh_token": "可选，auth.refreshToken 的值（配了就启用自动续期）",
     "enterpriseId": "可选，企业 ID",
     "domain": "可选",
     "endpoint": "可选，默认 https://copilot.tencent.com"
@@ -146,9 +157,11 @@ https://<你的worker域名>/status
 
 - `name` 是日志和结果页里显示的账号名，自取；缺省时取账号昵称，再缺省为「账号N」。重名会自动加序号。
 - `session` 字段也允许直接放一整段 **JSON 字符串**（即把凭据文件内容再包一层引号、转义后粘贴）；嫌转义麻烦就用第二种 `token + uid` 写法。
+- **`refresh_token`（可选）**：配置后启用 Token 自动续期，脚本会自动刷新 AT，基本不用再手动更新凭据。用 `session` 完整 JSON 写法时无需额外配置——`workbuddy-desktop.info` 里自带 `auth.refreshToken`，脚本会自动提取。用 `token + uid` 简化写法时需手动加此字段。详见 [Token 自动续期](#token-自动续期refresh-token)。
 - 每个账号的 token 独立做到期预警；某个账号配置写错或登录失效，**不影响其他账号**，结果页/日志里该账号单独标红。
 - 配置 `WORKBUDDY_ACCOUNTS` 后，单账号的 `WORKBUDDY_SESSION` / `WORKBUDDY_TOKEN` 会被忽略；改回单账号直接删掉本变量即可。
 - 只想手动调试某一个账号：URL 加 `?account=账号名`，例如 `/auto?account=主号`。
+- 首页账号列表中，已配置 RT 的账号会显示绿色「自动续期」徽章，未配置的显示灰色「未配续期」。
 
 > 升级提示：运行记录改为**每次运行写一个独立 key**（避免定时任务与手动触发并发时互相覆盖），写入后自动裁剪为最近 30 条。旧版单 key 的历史日志无需手动清理，在新记录产生前仍会被正常渲染。
 
@@ -225,6 +238,28 @@ Worker 的默认域名是公开的，任何人知道 URL 都能触发签到。�
 
 运行记录以 `signin:log:<时间>-<随机后缀>` 为键，只保留最近 30 条；另有 `signin:cron:last` 一个键保存**定时任务心跳**（首页那张卡片读的就是它），不受 30 条裁剪影响。
 
+### Token 自动续期（Refresh Token）
+
+配置了 Refresh Token（RT）后，脚本会自动刷新 accessToken，**基本不用再手动更新凭据**。
+
+**工作原理**：
+
+- 每次运行前检查当前 AT 是否临期（剩余 < 7 天）或距上次刷新超过 10 天，满足其一则调用刷新接口 `POST /v2/plugin/auth/token/refresh`，用 RT 换取新的 AT + RT；
+- 刷新后将新 RT 存入 KV（键 `signin:rt:<uid>`），下次运行优先使用 KV 中更新的凭据；
+- 环境变量里的初始凭据与 KV 里的刷新记录以 AT 的过期时间（exp）比较，谁更新用谁的——因此你重新登录桌面端、更新环境变量后，脚本会自动切换到新凭据。
+
+**配置方式**：
+
+- 用 `session` 完整 JSON 写法（粘贴 `workbuddy-desktop.info` 整段）：**无需额外操作**，文件里自带 `auth.refreshToken`，脚本自动提取；
+- 用 `token + uid` 简化写法：在账号项中加 `"refresh_token": "RT的值"`；
+- 单账号环境变量：新增可选 Secret `WORKBUDDY_REFRESH_TOKEN`。
+
+**前提条件**：必须绑定 KV 命名空间（变量名 `KV`），否则刷新后的 RT 无法持久化，续期功能会静默跳过。
+
+**首页标记**：已配置 RT 的账号在首页账号列表显示绿色「自动续期」徽章，未配置的显示灰色「未配续期」。执行结果页的账号卡片同样会显示该标记。
+
+**注意**：RT 本身也有有效期（离线会话约 30 天），定期刷新可保持其活跃。如果 RT 也失效了（刷新接口返回 401），需要重新登录桌面端并更新凭据。
+
 ## 运行结果说明
 
 ### 单账号 JSON（与旧版一致，顶层平铺）
@@ -270,8 +305,10 @@ Worker 的默认域名是公开的，任何人知道 URL 都能触发签到。�
 | `account` / `accounts` | 单账号名（固定 `default`）/ 多账号明细数组 |
 | `token_days_left` | 该账号登录令牌剩余有效天数（每次执行自动从令牌中解析） |
 | `token_expire_at` | 令牌到期日期（如 `2026-10-30`） |
+| `rt_enabled` | 该账号是否配置了 Refresh Token 自动续期（`true` / `false`） |
+| `growth` | 成长中心报告摘要（auto 动作时附带） |
 
-**令牌到期预警**：某账号令牌剩余 7 天以内时，其 `report` 开头会出现「【令牌 X 天后过期…】」醒目警告；已过期则 result 变为 `TOKEN_EXPIRED`。多账号时哪个账号报警就更新哪个，建议每 45 天左右主动更新一次。
+**令牌到期预警**：某账号令牌剩余 7 天以内时，其 `report` 开头会出现「【令牌 X 天后过期…】」醒目警告；已过期则 result 变为 `TOKEN_EXPIRED`。配置了 RT 自动续期的账号会在到期前自动刷新，report 中出现「🔄令牌已自动续期」；刷新失败时出现「⚠️令牌续期失败」。
 
 ## 常见问题排查
 
@@ -285,7 +322,10 @@ Worker 的默认域名是公开的，任何人知道 URL 都能触发签到。�
 复制时丢字了。重新打开凭据文件，确保从第一个 `{` 到最后一个 `}` 完整复制（记事本里 `Ctrl+A` 全选即可）。
 
 **问：返回 401 / 403（NO_SESSION / TOKEN_EXPIRED）**
-令牌过期。重新登录对应账号的 WorkBuddy 桌面端 → 重复[配置凭据](#配置凭据关键步骤)一节 → 重新部署。**令牌有有效期，这是日后最主要的维护动作**，建议把本节操作收藏。
+令牌过期。如果配置了 RT 自动续期，脚本会在到期前自动刷新，正常不会出现此问题。若仍出现，说明 RT 也失效了（离线会话约 30 天未活跃），需重新登录对应账号的 WorkBuddy 桌面端 → 重复[配置凭据](#配置凭据关键步骤)一节 → 重新部署。
+
+**问：怎么确认自动续期有没有生效？**
+首页账号列表中，已配置 RT 的账号显示绿色「自动续期」徽章。执行一次 `/auto` 后，如果 report 中出现「🔄令牌已自动续期」，说明本次触发了刷新。正常情况下刷新不会每次都发生（AT 剩余 >7 天且距上次刷新 <10 天时跳过），这是正常的。也可以在 KV 中查看 `signin:rt:<uid>` 键的 `refreshed_at` 字段确认上次刷新时间。
 
 **问：浏览器打开是页面，我自己的脚本想拿 JSON 怎么办？**
 请求头不带 `Accept: text/html`（curl 默认即是）。

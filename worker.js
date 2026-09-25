@@ -55,7 +55,7 @@
 // 日期（yyyymmdd）+ 当天第几次改动。当天第几个改动就写几；
 // 跨天则换成当天日期、序号从 1 重新开始。页脚会显示它——配合自动部署时，
 // 刷新页面看这一行变没变，就知道新版本上线没有。
-const BUILD_VERSION = "20260913:1";
+const BUILD_VERSION = "20260925:1";
 
 const DEFAULT_ENDPOINT = "https://copilot.tencent.com";
 
@@ -138,13 +138,14 @@ function buildAccount(conf, index, env) {
     // 容错：数组元素本身就是一段 info JSON
     session = conf;
   } else if (conf.token && conf.uid) {
-    // 形态二：{"name":"小号","token":"...","uid":"..."}
+    // 形态二：{"name":"小号","token":"...","uid":"...","refresh_token":"...（可选）"}
     session = {
       auth: { accessToken: conf.token },
       account: { uid: String(conf.uid) },
     };
     if (conf.enterpriseId) session.account.enterpriseId = conf.enterpriseId;
     if (conf.domain) session.auth.domain = conf.domain;
+    if (conf.refresh_token) session.auth.refreshToken = conf.refresh_token;
   } else {
     throw new Error("缺少 session（整段凭据 JSON）或 token+uid");
   }
@@ -154,7 +155,122 @@ function buildAccount(conf, index, env) {
   const tokenInfo = inspectToken(session.auth.accessToken);
   const acc = (session.account || {});
   const fallbackName = acc.nickname || acc.name || ("账号" + (index + 1));
-  return { name: conf.name ? String(conf.name) : String(fallbackName), uid: String(acc.uid || ""), headers, endpoint, tokenInfo };
+  // refreshToken 来自 session（info 文件自带 auth.refreshToken）或 conf.refresh_token
+  const refreshToken = (session.auth && session.auth.refreshToken) || null;
+  return {
+    name: conf.name ? String(conf.name) : String(fallbackName),
+    uid: String(acc.uid || ""),
+    headers, endpoint, tokenInfo, refreshToken,
+  };
+}
+
+/* ---------- Refresh Token 自动续期 ---------- */
+
+// 调刷新接口，用 RT 换新 AT + 新 RT。返回 {at, rt} 或 {error}。
+async function refreshAccessToken(rt) {
+  try {
+    const resp = await fetch(REFRESH_URL, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "X-Refresh-Token": rt,
+        "X-Auth-Refresh-Source": "plugin",
+      },
+      body: "{}",
+    });
+    const raw = await resp.text();
+    let body;
+    try { body = JSON.parse(raw); } catch (e) { body = { raw: raw.slice(0, 300) }; }
+    const data = (body && body.data) || {};
+    if (body && body.code === 0 && data.accessToken) {
+      return { at: data.accessToken, rt: data.refreshToken || rt };
+    }
+    return { error: (body && body.msg) || ("HTTP " + resp.status) };
+  } catch (e) {
+    return { error: String((e && e.message) || e) };
+  }
+}
+
+// 从 JWT 解析 exp（秒），解析失败返回 0
+function tokenExpireAt(token) {
+  try {
+    const parts = String(token).split(".");
+    if (parts.length < 2) return 0;
+    const payload = JSON.parse(atob(parts[1].replace(/-/g, "+").replace(/_/g, "/")));
+    return Number(payload.exp) || 0;
+  } catch (e) { return 0; }
+}
+
+// 续期主逻辑：比较环境变量 AT 与 KV 中 AT 的 exp，选更新的；
+// 满足刷新条件（AT 临期 或 距上次刷新过久）时调刷新接口，结果写回 KV。
+// 返回 { headers, note }，headers 为可能更新后的请求头，note 为追加到 report 的提示。
+async function ensureFreshToken(account, env) {
+  const envAT = (account.headers && account.headers["Authorization"]) ?
+    account.headers["Authorization"].replace(/^Bearer\s+/i, "") : "";
+  const envRT = account.refreshToken;
+  const envExp = tokenExpireAt(envAT);
+  const nowSec = Math.floor(Date.now() / 1000);
+
+  // 从 KV 读续期状态
+  const kv = await loadRtState(env, account.uid);
+  let curAT = envAT;
+  let curRT = envRT;
+  let refreshedAt = 0;
+  let refreshCount = 0;
+  let source = "env";
+
+  if (kv && kv.access_token && kv.refresh_token) {
+    const kvExp = tokenExpireAt(kv.access_token);
+    // KV 里的 AT 更新（exp 更晚）→ 用 KV 的整套凭据
+    if (kvExp > envExp) {
+      curAT = kv.access_token;
+      curRT = kv.refresh_token;
+      refreshedAt = Number(kv.refreshed_at) || 0;
+      refreshCount = Number(kv.refresh_count) || 0;
+      source = "kv";
+    }
+  }
+
+  // 没有 RT 就无法续期，直接返回现有 headers
+  if (!curRT) {
+    return { headers: account.headers, note: "" };
+  }
+
+  // 判断是否需要刷新
+  const curExp = tokenExpireAt(curAT);
+  const needRefresh = (curExp > 0 && (curExp - nowSec) < REFRESH_BEFORE_EXPIRE_SEC) ||
+    (refreshedAt > 0 && (nowSec - refreshedAt) > REFRESH_INTERVAL_SEC) ||
+    (curExp === 0); // AT 解析不出 exp 时也尝试刷新
+
+  if (!needRefresh) {
+    // 不需要刷新，但如果来源是 KV（AT 比环境变量新），需要用 KV 的 AT 重建 headers
+    if (source === "kv" && curAT !== envAT) {
+      const newHeaders = { ...account.headers, "Authorization": "Bearer " + curAT };
+      return { headers: newHeaders, note: "" };
+    }
+    return { headers: account.headers, note: "" };
+  }
+
+  // 执行刷新
+  const result = await refreshAccessToken(curRT);
+  if (result.error) {
+    // 刷新失败：仍用旧 AT 尝试，report 里给警告
+    const note = "⚠️令牌续期失败（" + result.error + "）";
+    const headers = (source === "kv" && curAT !== envAT) ?
+      { ...account.headers, "Authorization": "Bearer " + curAT } : account.headers;
+    return { headers, note };
+  }
+
+  // 刷新成功：写回 KV，用新 AT 重建 headers
+  await saveRtState(env, account.uid, {
+    uid: account.uid,
+    access_token: result.at,
+    refresh_token: result.rt,
+    refreshed_at: nowSec,
+    refresh_count: refreshCount + 1,
+  });
+  const newHeaders = { ...account.headers, "Authorization": "Bearer " + result.at };
+  return { headers: newHeaders, note: "🔄令牌已自动续期" };
 }
 
 // 解析出本次要执行的账号列表；配置非法时抛错，单个账号非法时该账号带 error 字段，不影响其他账号
@@ -198,6 +314,7 @@ function resolveAccounts(env, filterName) {
       };
       if (env.WORKBUDDY_ENTERPRISE_ID) session.account.enterpriseId = env.WORKBUDDY_ENTERPRISE_ID;
       if (env.WORKBUDDY_DOMAIN) session.auth.domain = env.WORKBUDDY_DOMAIN;
+      if (env.WORKBUDDY_REFRESH_TOKEN) session.auth.refreshToken = env.WORKBUDDY_REFRESH_TOKEN;
     }
     if (!session) {
       throw fail("CONFIG_ERROR",
@@ -373,21 +490,46 @@ async function runGrowth(headers, endpoint) {
     parts.push("Buddy 旅行中（" + locName + "）");
   }
 
-  // --- 2. 盲盒/抽奖（余额有多少次就抽多少次，上限 10 次防御异常余额） ---
+  // --- 2. 抽奖（lottery）：余额有多少次就抽多少次，上限 10 次防御异常余额 ---
   const l = await get(base + "/lottery/chances", headers);
   const chances = l.status >= 200 && l.status < 300 ? (dig(l.body, "balance") || 0) : 0;
   if (chances > 0) {
     const prizes = [];
     for (let i = 0; i < Math.min(chances, 10); i++) {
-      const d = await post(base + "/lottery/draw", headers, {});
+      const clientToken = "draw-" + Math.random().toString(36).slice(2, 10);
+      const d = await post(base + "/lottery/draw", headers, { client_token: clientToken });
       if (d.status >= 200 && d.status < 300) {
         prizes.push(dig(d.body, "prize_name") || dig(d.body, "prize") || "未知");
       } else {
-        parts.push("开盲盒失败（HTTP " + d.status + "）");
+        parts.push("抽奖失败（HTTP " + d.status + "）");
         break;
       }
     }
-    if (prizes.length) parts.push("开盲盒获得：" + prizes.join("、"));
+    if (prizes.length) parts.push("抽奖获得：" + prizes.join("、"));
+  }
+
+  // --- 2.5 真正的盲盒（buddy/open）：消耗能量开 Buddy 物品，每次 10 能量，最多 5 次 ---
+  // 与上面的 lottery 抽奖是两个独立功能：lottery 用抽奖次数，blindbox 用能量。
+  const q = await get(base + "/buddy/quota", headers);
+  const qd = q.status >= 200 && q.status < 300 ? (q.body && q.body.data) || {} : {};
+  const affordable = Number(qd.affordable) || 0;
+  if (affordable > 0) {
+    const blindboxItems = [];
+    for (let i = 0; i < Math.min(affordable, 5); i++) {
+      const d = await post(base + "/buddy/open", headers, { count: 1 });
+      if (d.status >= 200 && d.status < 300 && dig(d.body, "code") === 0) {
+        const results = dig(d.body, "results") || [];
+        if (results.length) {
+          const it = results[0];
+          const ins = it.instance || {};
+          const tpl = it.template || {};
+          blindboxItems.push((ins.name || tpl.name || "?") + "(" + (ins.rarity || tpl.rarity || "?") + ")");
+        }
+      } else {
+        break;
+      }
+    }
+    if (blindboxItems.length) parts.push("开盲盒获得：" + blindboxItems.join("、"));
   }
 
   // --- 3. 任务领奖 ---
@@ -419,6 +561,34 @@ async function runGrowth(headers, endpoint) {
   // dig 找不到时返回 null；?? null 归一，避免 days 为 undefined 时输出「连签 undefined 天」
   const streakObj = dig(s2.body, "streak") || {};
   const streakDays = streakObj && typeof streakObj === "object" ? (streakObj.days ?? null) : null;
+
+  // --- 4.5 连签兑换（redeem）：按 7d/14d/28d 档位兑换积分/能量/抽奖次数 ---
+  // 接口天然幂等：已兑换返回 code 409，天数不足返回 403，都静默跳过。
+  if (streakDays !== null && streakDays >= 7) {
+    const tiers = [
+      { tier: "7d", need: 7, label: "入门" },
+      { tier: "14d", need: 14, label: "进阶" },
+      { tier: "28d", need: 28, label: "巅峰" },
+    ];
+    for (const t of tiers) {
+      if (streakDays < t.need) continue;
+      const clientToken = "redeem-" + t.tier + "-" + Math.random().toString(36).slice(2, 10);
+      const resp = await post(base + "/redeem", headers, { tier: t.tier, client_token: clientToken });
+      const code = dig(resp.body, "code");
+      if (code === 0) {
+        const d = (resp.body && resp.body.data) || {};
+        const got = [];
+        const cg = Number(d.credit_granted) || 0;
+        const eg = Number(d.energy_granted) || 0;
+        const chg = Number(d.chances_granted) || 0;
+        if (cg) { creditsGained += cg; got.push("+" + cg + "积分"); }
+        if (eg) got.push("+" + eg + "能量");
+        if (chg) got.push("+" + chg + "抽奖");
+        parts.push("连签兑换" + t.label + "档（" + got.join(" ") + "）");
+      }
+      // code 409 = 已兑换过，403 = 天数不足，都静默不刷屏
+    }
+  }
 
   const tail = [];
   if (energy !== null) tail.push("能量 " + energy);
@@ -549,7 +719,7 @@ async function runOne(account, action, trigger, env) {
       },
     };
   }
-  const { headers, endpoint, tokenInfo } = account;
+  let { headers, endpoint, tokenInfo } = account;
 
   // —— 乐观并发锁（与 trae 版同机制）——
   // 拿不到 KV 或 KV 报错时不拦主流程：锁只是"尽力而为"的并发保护。
@@ -565,6 +735,15 @@ async function runOne(account, action, trigger, env) {
   }
 
   try {
+    // —— Refresh Token 自动续期 ——
+    // 有 RT 或 KV 中有续期记录时，检查是否需要刷新；刷新成功后用新 AT 重建 headers。
+    let refreshNote = "";
+    if (account.refreshToken || (kv && account.uid)) {
+      const fresh = await ensureFreshToken(account, env);
+      if (fresh.headers) headers = fresh.headers;
+      if (fresh.note) refreshNote = fresh.note;
+    }
+
     let r;
     switch (action) {
       case "auto": {
@@ -595,9 +774,15 @@ async function runOne(account, action, trigger, env) {
         return { code: 2, out: { account: account.name, trigger: trigger, result: "BAD_ACTION", report: "未知 action：" + action + "（可选 auto/growth/status/claim）" } };
     }
 
+    // 续期提示追加到 report 开头（status/claim 调试动作没有 report 字段时跳过）
+    if (refreshNote && r.out.report) {
+      r.out.report = refreshNote + "；" + r.out.report;
+    }
+
     // 附上账号名、执行来源与令牌到期预警
     r.out.account = account.name;
     r.out.trigger = trigger;
+    r.out.rt_enabled = !!account.refreshToken; // 该账号是否配置了 RT 自动续期
     r.out = applyTokenWarning(r.out, tokenInfo);
     return r;
   } finally {
@@ -678,6 +863,27 @@ const CRON_KEY = "signin:cron:last";
 // 防止 cron 与手动 /auto 同时触发时，对同一账号并行请求上游。
 const LOCK_PREFIX = "signin:lock:";
 const LOCK_TTL = 90; // 秒
+// Refresh Token 续期状态：按 uid 分 key，存最新 AT/RT 与上次刷新时间。
+// 与环境变量里的初始凭据配合——谁的 AT 更新（exp 更晚）就用谁的，刷新结果统一落 KV。
+const RT_STORE_PREFIX = "signin:rt:";
+const REFRESH_URL = "https://copilot.tencent.com/v2/plugin/auth/token/refresh";
+const REFRESH_INTERVAL_SEC = 10 * 86400; // 距上次刷新超过 10 天则续期
+const REFRESH_BEFORE_EXPIRE_SEC = 7 * 86400; // AT 剩余不足 7 天则续期
+
+async function loadRtState(env, uid) {
+  if (!env.KV || !uid) return null;
+  try {
+    const raw = await env.KV.get(RT_STORE_PREFIX + uid);
+    return raw ? JSON.parse(raw) : null;
+  } catch (e) { return null; }
+}
+
+async function saveRtState(env, uid, state) {
+  if (!env.KV || !uid) return;
+  try {
+    await env.KV.put(RT_STORE_PREFIX + uid, JSON.stringify(state));
+  } catch (e) { /* KV 写入失败不阻塞主流程 */ }
+}
 
 // 列出全部日志 key，按时间倒序（新 → 旧）
 async function listLogKeys(env) {
@@ -901,6 +1107,24 @@ function displayName(n) {
   return n && n !== "default" ? n : "默认账号";
 }
 
+// RT 自动续期状态徽章：enabled=true 绿色"自动续期"，false 灰色"未配续期"
+function rtBadgeHtml(enabled) {
+  if (enabled) {
+    return '<span class="badge b-ok" style="margin-left:6px;">自动续期</span>';
+  }
+  return '<span class="badge b-inactive" style="margin-left:6px;">未配续期</span>';
+}
+
+// 判断账号是否启用了 RT 自动续期：环境变量配了 RT，或 KV 里已有续期记录（之前跑过）
+async function accountRtEnabled(a, env) {
+  if (a.refreshToken) return true;
+  if (env.KV && a.uid) {
+    const st = await loadRtState(env, a.uid);
+    if (st && st.refresh_token) return true;
+  }
+  return false;
+}
+
 function accountCard(a) {
   const meta = [];
   if (a.credit != null) meta.push("本次 " + a.credit + " 积分");
@@ -915,8 +1139,10 @@ function accountCard(a) {
   const nameHtml = (a.account && a.account !== "default")
     ? '<span class="accname">' + escapeHtml(a.account) + "</span>"
     : "";
+  // RT 自动续期状态标记（rt_enabled 字段由 runOne 附上）
+  const rtBadge = (a.rt_enabled != null) ? rtBadgeHtml(!!a.rt_enabled) : "";
   let html = '<div class="card"><div class="cardhd">' +
-    nameHtml + badgeHtml(a) +
+    nameHtml + rtBadge + badgeHtml(a) +
     (a.http != null ? '<span class="sub">HTTP ' + a.http + "</span>" : "") +
     '</div><div class="report">' + escapeHtml(a.report || debugBrief(a) || "-") + "</div>";
   if (a.growth) html += '<div class="meta">成长中心：' + escapeHtml(a.growth) + "</div>";
@@ -1021,7 +1247,9 @@ async function renderHome(env, keyPart) {
   let accBlock;
   try {
     const accs = resolveAccounts(env);
-    const lines = accs.map((a) => {
+    // 并行查询每个账号的 RT 续期状态（环境变量配了 RT 或 KV 有续期记录即为已启用）
+    const rtFlags = await Promise.all(accs.map((a) => accountRtEnabled(a, env)));
+    const lines = accs.map((a, i) => {
       if (a.error) return escapeHtml(displayName(a.name)) + '：<span style="color:#B03A3C;">配置无效（' + escapeHtml(a.error) + "）</span>";
       let t = "";
       if (a.tokenInfo) {
@@ -1030,7 +1258,7 @@ async function renderHome(env, keyPart) {
           ? '，<span style="color:#B03A3C;">令牌已过期（' + expireDate + "）</span>"
           : "，令牌剩 " + a.tokenInfo.daysLeft + " 天（" + expireDate + " 到期）";
       }
-      return escapeHtml(displayName(a.name)) + t;
+      return escapeHtml(displayName(a.name)) + rtBadgeHtml(rtFlags[i]) + t;
     });
     accBlock = '<div class="card">已配置 <b>' + accs.length + "</b> 个账号：<br>" + lines.join("<br>") + "</div>";
   } catch (e) {
