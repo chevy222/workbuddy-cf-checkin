@@ -274,9 +274,15 @@ async function ensureFreshToken(account, env) {
 }
 
 // 解析出本次要执行的账号列表；配置非法时抛错，单个账号非法时该账号带 error 字段，不影响其他账号
+// 支持三种配置方式（可混用）：
+//   1. WORKBUDDY_ACCOUNTS        —— JSON 数组，所有账号写在一个 Secret 里（账号少时方便）
+//   2. WORKBUDDY_ACCOUNT_1 / _2  —— 每个账号一个独立 Secret（账号多、单 Secret 超 10KB 上限时用）
+//   3. WORKBUDDY_SESSION 等       —— 单账号兼容
 function resolveAccounts(env, filterName) {
   const accounts = [];
+  const rawConfs = []; // {conf, source} 收集所有账号原始配置，统一解析
 
+  // 方式一：WORKBUDDY_ACCOUNTS 数组（兼容旧配置）
   if (env.WORKBUDDY_ACCOUNTS) {
     let arr;
     try {
@@ -287,7 +293,31 @@ function resolveAccounts(env, filterName) {
     if (!Array.isArray(arr) || !arr.length) {
       throw fail("CONFIG_ERROR", "WORKBUDDY_ACCOUNTS 必须是非空 JSON 数组");
     }
-    arr.forEach((conf, i) => {
+    arr.forEach((conf) => rawConfs.push({ conf, source: "WORKBUDDY_ACCOUNTS" }));
+  }
+
+  // 方式二：WORKBUDDY_ACCOUNT_<N> 独立变量（每个账号一个 Secret，避开单 Secret 10KB 上限）
+  // 扫描所有以 WORKBUDDY_ACCOUNT_ 开头且后面跟数字的变量；WORKBUDDY_ACCOUNTS（复数）不在此列
+  const indexedKeys = Object.keys(env)
+    .filter((k) => /^WORKBUDDY_ACCOUNT_\d+$/.test(k))
+    .sort((a, b) => Number(a.slice("WORKBUDDY_ACCOUNT_".length)) - Number(b.slice("WORKBUDDY_ACCOUNT_".length)));
+  for (const key of indexedKeys) {
+    const val = env[key];
+    if (!val) continue;
+    let conf;
+    try {
+      conf = JSON.parse(val);
+    } catch (e) {
+      throw fail("CONFIG_ERROR", key + " 不是合法 JSON（需为对象，含 name 与 session 或 token+uid）");
+    }
+    if (!conf || typeof conf !== "object") {
+      throw fail("CONFIG_ERROR", key + " 必须是 JSON 对象");
+    }
+    rawConfs.push({ conf, source: key });
+  }
+
+  if (rawConfs.length) {
+    rawConfs.forEach(({ conf }, i) => {
       try {
         accounts.push(buildAccount(conf, i, env));
       } catch (e) {
@@ -299,7 +329,7 @@ function resolveAccounts(env, filterName) {
       }
     });
   } else {
-    // 向后兼容：单账号环境变量
+    // 方式三：向后兼容——单账号环境变量
     let session = null;
     if (env.WORKBUDDY_SESSION) {
       try {
@@ -319,8 +349,8 @@ function resolveAccounts(env, filterName) {
     if (!session) {
       throw fail("CONFIG_ERROR",
         "未配置登录凭据。请在 Worker 的 设置 → 变量和机密 中添加 Secret：" +
-        "多账号用 WORKBUDDY_ACCOUNTS（JSON 数组）；单账号用 WORKBUDDY_SESSION（workbuddy-desktop.info 完整 JSON），" +
-        "或分别添加 WORKBUDDY_TOKEN 与 WORKBUDDY_UID。"
+        "多账号用 WORKBUDDY_ACCOUNTS（JSON 数组）或 WORKBUDDY_ACCOUNT_1、WORKBUDDY_ACCOUNT_2（每号一个）；" +
+        "单账号用 WORKBUDDY_SESSION（workbuddy-desktop.info 完整 JSON），或分别添加 WORKBUDDY_TOKEN 与 WORKBUDDY_UID。"
       );
     }
     accounts.push(buildAccount({ name: "default", session: session }, 0, env));

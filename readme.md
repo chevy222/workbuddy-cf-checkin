@@ -133,7 +133,11 @@ https://<你的worker域名>/status
 
 ## 多账号配置
 
-多个账号时使用一个 Secret：变量名 `WORKBUDDY_ACCOUNTS`，值为一个 **JSON 数组**，每个账号一项，支持两种写法（可混用）：
+多账号有两种配置方式，**任选其一**（也可混用）：
+
+### 方式一：一个 Secret 存全部账号（账号少的时候用）
+
+变量名 `WORKBUDDY_ACCOUNTS`，值为一个 **JSON 数组**，每个账号一项，支持两种写法（可混用）：
 
 ```json
 [
@@ -153,13 +157,27 @@ https://<你的worker域名>/status
 ]
 ```
 
+### 方式二：每个账号一个独立 Secret（账号多、单 Secret 超 10KB 上限时用）
+
+Cloudflare 单个 Secret 上限 10KB，账号多了 `WORKBUDDY_ACCOUNTS` 会存不下。此时把每个账号拆成独立变量：
+
+| 变量名 | 值 |
+|---|---|
+| `WORKBUDDY_ACCOUNT_1` | `{"name":"主号","session":{ info 文件完整 JSON }}` |
+| `WORKBUDDY_ACCOUNT_2` | `{"name":"小号","token":"...","uid":"...","refresh_token":"..."}` |
+| `WORKBUDDY_ACCOUNT_3` | 第三个账号…… |
+
+变量名必须是 `WORKBUDDY_ACCOUNT_` 加数字（从 1 开始，序号决定执行顺序），每个变量的值是**一个 JSON 对象**（和方式一数组里的每一项完全一样）。有几个账号就建几个 Secret，互不影响。
+
+> 两种方式可以同时存在，脚本会把两边的账号合并执行。通常只用一种即可。
+
 要点：
 
 - `name` 是日志和结果页里显示的账号名，自取；缺省时取账号昵称，再缺省为「账号N」。重名会自动加序号。
 - `session` 字段也允许直接放一整段 **JSON 字符串**（即把凭据文件内容再包一层引号、转义后粘贴）；嫌转义麻烦就用第二种 `token + uid` 写法。
 - **`refresh_token`（可选）**：配置后启用 Token 自动续期，脚本会自动刷新 AT，基本不用再手动更新凭据。用 `session` 完整 JSON 写法时无需额外配置——`workbuddy-desktop.info` 里自带 `auth.refreshToken`，脚本会自动提取。用 `token + uid` 简化写法时需手动加此字段。详见 [Token 自动续期](#token-自动续期refresh-token)。
 - 每个账号的 token 独立做到期预警；某个账号配置写错或登录失效，**不影响其他账号**，结果页/日志里该账号单独标红。
-- 配置 `WORKBUDDY_ACCOUNTS` 后，单账号的 `WORKBUDDY_SESSION` / `WORKBUDDY_TOKEN` 会被忽略；改回单账号直接删掉本变量即可。
+- 配置了多账号变量后，单账号的 `WORKBUDDY_SESSION` / `WORKBUDDY_TOKEN` 会被忽略；改回单账号直接删掉多账号变量即可。
 - 只想手动调试某一个账号：URL 加 `?account=账号名`，例如 `/auto?account=主号`。
 - 首页账号列表中，已配置 RT 的账号会显示绿色「自动续期」徽章，未配置的显示灰色「未配续期」。
 
