@@ -55,18 +55,15 @@
 // 日期（yyyymmdd）+ 当天第几次改动。当天第几个改动就写几；
 // 跨天则换成当天日期、序号从 1 重新开始。页脚会显示它——配合自动部署时，
 // 刷新页面看这一行变没变，就知道新版本上线没有。
-const BUILD_VERSION = "20260925:2";
+const BUILD_VERSION = "20260926:1";
 
 const DEFAULT_ENDPOINT = "https://copilot.tencent.com";
 
 /* ---------- HTTP 基础（对应 Python 的 _request/post/get） ---------- */
 
 async function request(url, headers, method = "GET", payload = null) {
-  const init = { method, headers };
+  const init = { method, headers, signal: AbortSignal.timeout(30000) };
   if (payload !== null && payload !== undefined) init.body = JSON.stringify(payload);
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), 30000);
-  init.signal = controller.signal;
   try {
     const resp = await fetch(url, init);
     const raw = await resp.text();
@@ -80,8 +77,6 @@ async function request(url, headers, method = "GET", payload = null) {
   } catch (e) {
     const reason = e && e.name === "AbortError" ? "请求超时(30s)" : String((e && e.message) || e);
     return { status: -1, body: { error: reason } };
-  } finally {
-    clearTimeout(timer);
   }
 }
 
@@ -185,6 +180,7 @@ async function refreshAccessToken(rt) {
         "X-Auth-Refresh-Source": "plugin",
       },
       body: "{}",
+      signal: AbortSignal.timeout(30000),
     });
     const raw = await resp.text();
     let body;
@@ -195,7 +191,8 @@ async function refreshAccessToken(rt) {
     }
     return { error: (body && body.msg) || ("HTTP " + resp.status) };
   } catch (e) {
-    return { error: String((e && e.message) || e) };
+    const reason = e && e.name === "AbortError" ? "刷新请求超时(30s)" : String((e && e.message) || e);
+    return { error: reason };
   }
 }
 
@@ -211,7 +208,7 @@ function tokenExpireAt(token) {
 
 // 续期主逻辑：比较环境变量 AT 与 KV 中 AT 的 exp，选更新的；
 // 满足刷新条件（AT 临期 或 距上次刷新过久）时调刷新接口，结果写回 KV。
-// 返回 { headers, note }，headers 为可能更新后的请求头，note 为追加到 report 的提示。
+// 返回 { headers, note, accessToken }，accessToken 为当前实际使用的 AT（供调用方重算 tokenInfo）。
 async function ensureFreshToken(account, env) {
   const envAT = (account.headers && account.headers["Authorization"]) ?
     account.headers["Authorization"].replace(/^Bearer\s+/i, "") : "";
@@ -241,7 +238,7 @@ async function ensureFreshToken(account, env) {
 
   // 没有 RT 就无法续期，直接返回现有 headers
   if (!curRT) {
-    return { headers: account.headers, note: "" };
+    return { headers: account.headers, note: "", accessToken: envAT };
   }
 
   // 判断是否需要刷新
@@ -254,9 +251,9 @@ async function ensureFreshToken(account, env) {
     // 不需要刷新，但如果来源是 KV（AT 比环境变量新），需要用 KV 的 AT 重建 headers
     if (source === "kv" && curAT !== envAT) {
       const newHeaders = { ...account.headers, "Authorization": "Bearer " + curAT };
-      return { headers: newHeaders, note: "" };
+      return { headers: newHeaders, note: "", accessToken: curAT };
     }
-    return { headers: account.headers, note: "" };
+    return { headers: account.headers, note: "", accessToken: envAT };
   }
 
   // 执行刷新
@@ -266,7 +263,7 @@ async function ensureFreshToken(account, env) {
     const note = "⚠️令牌续期失败（" + result.error + "）";
     const headers = (source === "kv" && curAT !== envAT) ?
       { ...account.headers, "Authorization": "Bearer " + curAT } : account.headers;
-    return { headers, note };
+    return { headers, note, accessToken: curAT };
   }
 
   // 刷新成功：写回 KV，用新 AT 重建 headers
@@ -278,7 +275,7 @@ async function ensureFreshToken(account, env) {
     refresh_count: refreshCount + 1,
   });
   const newHeaders = { ...account.headers, "Authorization": "Bearer " + result.at };
-  return { headers: newHeaders, note: "🔄令牌已自动续期" };
+  return { headers: newHeaders, note: "🔄令牌已自动续期", accessToken: result.at };
 }
 
 // 解析出本次要执行的账号列表；配置非法时抛错，单个账号非法时该账号带 error 字段，不影响其他账号
@@ -486,6 +483,12 @@ async function runGrowth(headers, endpoint) {
   const base = endpoint + "/v2/activity/growth";
   const parts = [];
   let creditsGained = 0;
+  // 请求成功率统计：shadow 全局 get/post，自动计数。
+  // 全部请求失败时返回 ERROR，避免上游宕机被静默判为"成长中心无可领取项"。
+  let reqTotal = 0, reqFailed = 0;
+  const _g = get, _p = post;
+  const get = async (url, h) => { reqTotal++; const r = await _g(url, h); if (r.status < 200 || r.status >= 300) reqFailed++; return r; };
+  const post = async (url, h, body) => { reqTotal++; const r = await _p(url, h, body); if (r.status < 200 || r.status >= 300) reqFailed++; return r; };
 
   // --- 1. Buddy 旅行：领礼物 + 派出发 ---
   const s = await get(base + "/buddy/travel/status", headers);
@@ -542,7 +545,11 @@ async function runGrowth(headers, endpoint) {
       const clientToken = "draw-" + Math.random().toString(36).slice(2, 10);
       const d = await post(base + "/lottery/draw", headers, { client_token: clientToken });
       if (d.status >= 200 && d.status < 300) {
-        prizes.push(dig(d.body, "prize_name") || dig(d.body, "prize") || "未知");
+        const dd = (d.body && d.body.data) || {};
+        prizes.push(dig(dd, "prize_name") || dig(dd, "name") || "未知");
+        // 抽奖可能产积分（credit_amount / credit / reward_credit），累加到合计
+        const lc = Number(dig(dd, "credit_amount") || dig(dd, "credit") || dig(dd, "reward_credit")) || 0;
+        if (lc) creditsGained += lc;
       } else {
         parts.push("抽奖失败（HTTP " + d.status + "）");
         break;
@@ -561,12 +568,17 @@ async function runGrowth(headers, endpoint) {
     for (let i = 0; i < Math.min(affordable, 5); i++) {
       const d = await post(base + "/buddy/open", headers, { count: 1 });
       if (d.status >= 200 && d.status < 300 && dig(d.body, "code") === 0) {
-        const results = dig(d.body, "results") || [];
+        const dd = (d.body && d.body.data) || {};
+        const results = dig(dd, "results") || [];
         if (results.length) {
           const it = results[0];
           const ins = it.instance || {};
           const tpl = it.template || {};
           blindboxItems.push((ins.name || tpl.name || "?") + "(" + (ins.rarity || tpl.rarity || "?") + ")");
+          // 盲盒可能产积分，尝试从 data 层或 results[0] 层取
+          const bc = Number(dig(dd, "credit_amount") || dig(dd, "credit_granted") || dig(dd, "reward_credit")
+            || dig(it, "credit") || dig(ins, "credit") || dig(tpl, "credit")) || 0;
+          if (bc) creditsGained += bc;
         }
       } else {
         break;
@@ -631,6 +643,11 @@ async function runGrowth(headers, endpoint) {
       }
       // code 409 = 已兑换过，403 = 天数不足，都静默不刷屏
     }
+  }
+
+  // 全部请求失败（上游宕机/网络异常）时返回 ERROR，不与"今天没东西可领"混淆
+  if (reqTotal > 0 && reqFailed === reqTotal) {
+    return { code: 1, out: { result: "ERROR", report: "成长中心全部请求失败（" + reqFailed + "/" + reqTotal + "），上游服务可能异常" } };
   }
 
   const tail = [];
@@ -779,12 +796,15 @@ async function runOne(account, action, trigger, env) {
 
   try {
     // —— Refresh Token 自动续期 ——
-    // 有 RT 或 KV 中有续期记录时，检查是否需要刷新；刷新成功后用新 AT 重建 headers。
+    // 有 RT 或 KV 中有续期记录时，检查是否需要刷新；刷新成功后用新 AT 重建 headers 并重算 tokenInfo。
     let refreshNote = "";
     if (account.refreshToken || (kv && account.uid)) {
       const fresh = await ensureFreshToken(account, env);
       if (fresh.headers) headers = fresh.headers;
       if (fresh.note) refreshNote = fresh.note;
+      // 续期后实际使用的 AT 可能已变（KV 里的更新 AT 或刷新后的新 AT），必须重算 tokenInfo，
+      // 否则 applyTokenWarning 仍按环境变量里的旧 AT 判定过期，会把续期成功的账号误报为 TOKEN_EXPIRED。
+      if (fresh.accessToken) tokenInfo = inspectToken(fresh.accessToken) || tokenInfo;
     }
 
     let r;
@@ -805,12 +825,15 @@ async function runOne(account, action, trigger, env) {
         break;
       case "status": {
         const s = await post(endpoint + "/v2/billing/meter/checkin-activity-status", headers);
-        r = { code: 0, out: { step: "status", http: s.status, body: s.body } };
+        const authFail = s.status === 401 || s.status === 403;
+        // 401/403 时 code 设为 1 并标 NO_SESSION，否则 httpStatusFor 恒返回 200，监控测不到登录失效
+        r = { code: authFail ? 1 : 0, out: { step: "status", http: s.status, body: s.body, result: authFail ? "NO_SESSION" : undefined } };
         break;
       }
       case "claim": {
         const c = await post(endpoint + "/v2/billing/meter/daily-checkin", headers);
-        r = { code: 0, out: { step: "claim", http: c.status, body: c.body } };
+        const authFail = c.status === 401 || c.status === 403;
+        r = { code: authFail ? 1 : 0, out: { step: "claim", http: c.status, body: c.body, result: authFail ? "NO_SESSION" : undefined } };
         break;
       }
       default:
@@ -1347,8 +1370,12 @@ const HTTP_STATUS_BY_RESULT = {
 };
 
 function httpStatusFor(out, code) {
-  if (code === 0) return 200;
-  return HTTP_STATUS_BY_RESULT[(out && out.result) || ""] || 500;
+  // result 映射优先：NO_SESSION / TOKEN_EXPIRED → 401，CONFIG_ERROR → 400 等。
+  // 不能先判 code===0 返回 200——applyTokenWarning 只改 out.result 不改 code，
+  // 否则 TOKEN_EXPIRED 会被 code===0 短路成 200，监控测不到令牌过期。
+  const byResult = HTTP_STATUS_BY_RESULT[(out && out.result) || ""];
+  if (byResult) return byResult;
+  return code === 0 ? 200 : 500;
 }
 
 // 可执行动作集合（日志走独立路由 /logs）
