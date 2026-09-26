@@ -80,33 +80,25 @@ Workers 运行在云端、没有本地文件系统，无法直接使用 WorkBudd
 
 ### 1. 通过短信登录获取明文凭据（推荐）
 
-新版 WorkBuddy 桌面端的 `workbuddy-desktop.info` 中 `accessToken` / `refreshToken` 已被加密包装，无法直接复制使用。项目自带 PowerShell 短信登录工具，通过官方插件接口直接获取明文 token：
+新版 WorkBuddy 桌面端的 `workbuddy-desktop.info` 中 `accessToken` / `refreshToken` 已被加密包装，无法直接复制使用。通过官方插件接口用短信登录直接拿明文 token，分两步：
+
+**第一步：发送验证码**（把 `13800000000` 换成你的手机号）
 
 ```powershell
-pwsh workbuddy-login.ps1
+Invoke-RestMethod -Uri "https://www.workbuddy.cn/v2/plugin/login/send-sms" -Method Post -ContentType "application/json" -Body '{"phone":"13800000000"}'
 ```
 
-按提示操作：输入手机号 → 收到验证码 → 输入验证码，脚本会输出三行值：
+返回 `code: 0` 即发送成功，等收短信。
 
-```
-WORKBUDDY_TOKEN         = eyJhbGciOi...（明文 AccessToken）
-WORKBUDDY_UID           = d682dc6b-...（从 AT 解析的用户 ID）
-WORKBUDDY_REFRESH_TOKEN = eyJhbGciOi...（明文 RefreshToken）
-```
-
-也可以一步到位（跳过交互）：
+**第二步：用验证码登录拿 token**（把手机号和 `123456` 换成实际收到的验证码）
 
 ```powershell
-pwsh workbuddy-login.ps1 -Phone 13800000000 -SmsCode 123456
+$r = Invoke-RestMethod -Uri "https://www.workbuddy.cn/v2/plugin/login/token" -Method Post -ContentType "application/json" -Body '{"login_method":"phone","phone":"13800000000","sms_code":"123456"}'; $at=$r.data.accessToken; $rt=$r.data.refreshToken; $p=$at.Split('.')[1].Replace('-','+').Replace('_','/'); $p=$p.PadRight($p.Length+(4-$p.Length%4)%4,'='); $j=[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($p))|ConvertFrom-Json; Write-Host "WORKBUDDY_TOKEN=$at"; Write-Host "WORKBUDDY_UID=$($j.sub)"; Write-Host "WORKBUDDY_REFRESH_TOKEN=$rt"
 ```
 
-加 `-VerifyRt` 可在登录后额外验证 RT 是否能正常刷新：
+执行后输出三行值，直接复制到下一步配置。
 
-```powershell
-pwsh workbuddy-login.ps1 -VerifyRt
-```
-
-> 工具仅依赖 PowerShell 7+（`pwsh`），无需安装 Python 或其他依赖。Windows 10/11 自带 PowerShell 5.1 也能运行，但建议用 [PowerShell 7](https://aka.ms/powershell)。
+> 在 PowerShell 7（`pwsh`）或 Windows PowerShell 5.1 中均可执行，无需安装任何依赖。
 
 ### 2. 配置到 Worker 变量（单账号）
 
