@@ -156,9 +156,9 @@ https://<你的worker域名>/status
 ]
 ```
 
-### 方式二：每个账号一个独立 Secret（账号多、单 Secret 超 10KB 上限时用）
+### 方式二：每个账号一个独立 Secret（账号多、单 Secret 超 5KB 上限时用）
 
-Cloudflare 单个 Secret 上限 10KB，账号多了 `WORKBUDDY_ACCOUNTS` 会存不下。此时把每个账号拆成独立变量：
+Cloudflare 单个 Secret 上限 5KB，账号多了 `WORKBUDDY_ACCOUNTS` 会存不下。此时把每个账号拆成独立变量：
 
 | 变量名 | 值 |
 |---|---|
