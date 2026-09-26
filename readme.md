@@ -78,52 +78,56 @@ Workers 运行在云端、没有本地文件系统，无法直接使用 WorkBudd
 
 ## 配置凭据（关键步骤）
 
-### 1. 找到并复制本机凭据文件
+### 1. 通过短信登录获取明文凭据（推荐）
 
-登录过 WorkBuddy 桌面端后，凭据文件位于（Windows）：
+新版 WorkBuddy 桌面端的 `workbuddy-desktop.info` 中 `accessToken` / `refreshToken` 已被加密包装，无法直接复制使用。项目自带 PowerShell 短信登录工具，通过官方插件接口直接获取明文 token：
 
-```
-%LOCALAPPDATA%\CodeBuddyExtension\Data\Public\auth\workbuddy-desktop.info
-```
-
-即：
-
-```
-C:\Users\<你的用户名>\AppData\Local\CodeBuddyExtension\Data\Public\auth\workbuddy-desktop.info
+```powershell
+pwsh workbuddy-login.ps1
 ```
 
-> macOS 路径：`~/Library/Application Support/CodeBuddyExtension/Data/Public/auth/workbuddy-desktop.info`
+按提示操作：输入手机号 → 收到验证码 → 输入验证码，脚本会输出三行值：
 
-打开方式任选其一：
+```
+WORKBUDDY_TOKEN         = eyJhbGciOi...（明文 AccessToken）
+WORKBUDDY_UID           = d682dc6b-...（从 AT 解析的用户 ID）
+WORKBUDDY_REFRESH_TOKEN = eyJhbGciOi...（明文 RefreshToken）
+```
 
-- `Win + R` 输入 `notepad` 回车，把文件拖进记事本窗口；
-- 或在记事本里 文件 → 打开，把上面的完整路径粘贴到文件名栏（注意「文件类型」选「所有文件」）。
+也可以一步到位（跳过交互）：
 
-打开后是一段 JSON。`Ctrl + A` 全选 → `Ctrl + C` 复制。**只有一个账号**时按下节配置即可；**多个账号**直接看 [多账号配置](#多账号配置)。
+```powershell
+pwsh workbuddy-login.ps1 -Phone 13800000000 -SmsCode 123456
+```
 
-> **新版桌面端格式说明**：较新版本的 WorkBuddy 桌面端会把 `auth.accessToken` 和 `auth.refreshToken` 包成 `{"$wbEncrypted":1,"envelope":"实际token"}` 的形式（token 明文在 `envelope` 字段里，并非真加密）。脚本已自动兼容两种格式，直接整段复制粘贴即可，无需手动解包。
->
-> 注意：只有 `auth.accessToken` 和 `auth.refreshToken` 有这个包装；`account.uid`、`account.nickname`、`account.enterpriseId` 等其他字段仍然是普通值，没有 envelope。
+加 `-VerifyRt` 可在登录后额外验证 RT 是否能正常刷新：
 
-### 2. 配置到 Worker 的 Secret（单账号）
+```powershell
+pwsh workbuddy-login.ps1 -VerifyRt
+```
+
+> 工具仅依赖 PowerShell 7+（`pwsh`），无需安装 Python 或其他依赖。Windows 10/11 自带 PowerShell 5.1 也能运行，但建议用 [PowerShell 7](https://aka.ms/powershell)。
+
+### 2. 配置到 Worker 变量（单账号）
 
 1. 进入你的 Worker → **设置** → **变量和机密**；
-2. 点 **添加**，类型选择 **机密（Secret）**（不要选「文本」类型，Secret 是加密存储、部署后不可回读的，更安全）；
-3. 变量名：`WORKBUDDY_SESSION`；值：粘贴上一步复制的内容；保存。
-4. **注意**：修改变量后必须**重新部署一次**才生效——回到「编辑代码」页再点一次「部署」即可。
+2. 点 **添加**，类型选择 **机密（Secret）**（Secret 是加密存储、部署后不可回读的，更安全）；
+3. 依次添加以下三个变量（值为上一步脚本的输出）：
 
-### 简化替代方案（不想贴整段 JSON 时）
+| 变量名 | 值 | 必填 |
+|---|---|---|
+| `WORKBUDDY_TOKEN` | 脚本输出的 `WORKBUDDY_TOKEN` | ✅ |
+| `WORKBUDDY_UID` | 脚本输出的 `WORKBUDDY_UID` | ✅ |
+| `WORKBUDDY_REFRESH_TOKEN` | 脚本输出的 `WORKBUDDY_REFRESH_TOKEN` | 可选，配了就启用自动续期 |
 
-也可以只配两个 Secret：
+4. 企业账号可再加 `WORKBUDDY_ENTERPRISE_ID`；
+5. **注意**：修改变量后必须**重新部署一次**才生效——回到「编辑代码」页再点一次「部署」即可。
 
-| 变量名 | 值 |
-|---|---|
-| `WORKBUDDY_TOKEN` | 凭据文件里 `auth.accessToken` 的值（新版格式是 `{"$wbEncrypted":1,"envelope":"..."}` 对象，取其中 `envelope` 字段的实际 token 字符串） |
-| `WORKBUDDY_UID` | 凭据文件里 `account.uid` 的值（纯数字/字符串，没有 envelope） |
+### 旧版方式（info 文件未加密时）
 
-企业账号可再加 `WORKBUDDY_ENTERPRISE_ID`；两种方案二选一，同时配置时以 `WORKBUDDY_SESSION` 优先。
+如果你的 WorkBuddy 桌面端版本较旧，`workbuddy-desktop.info` 中 `accessToken` / `refreshToken` 仍是纯字符串（而非 `{"$wbEncrypted":1,"envelope":"..."}` 对象），可以直接复制整段 JSON 配到 `WORKBUDDY_SESSION` 变量，脚本会自动解析。此方式无需短信登录，但新版桌面端已不适用。
 
-> 如需启用 **Token 自动续期**，简化方案还需再加一个 Secret `WORKBUDDY_REFRESH_TOKEN`（值为凭据文件里 `auth.refreshToken`，新版格式同样取 `envelope` 字段里的实际 token）。用完整 `WORKBUDDY_SESSION` 方案时无需额外配置，文件里自带 RT，脚本会自动解包。
+凭据文件路径（Windows）：`%LOCALAPPDATA%\CodeBuddyExtension\Data\Public\auth\workbuddy-desktop.info`
 
 ### 3. 验证
 
@@ -137,26 +141,25 @@ https://<你的worker域名>/status
 
 ## 多账号配置
 
-多账号有两种配置方式，**任选其一**（也可混用）：
+多账号有两种配置方式，**任选其一**（也可混用）。每个账号的 token 先用 `workbuddy-login.ps1` 短信登录获取。
 
 ### 方式一：一个 Secret 存全部账号（账号少的时候用）
 
-变量名 `WORKBUDDY_ACCOUNTS`，值为一个 **JSON 数组**，每个账号一项，支持两种写法（可混用）：
+变量名 `WORKBUDDY_ACCOUNTS`，值为一个 **JSON 数组**，每个账号一项：
 
 ```json
 [
   {
     "name": "主号",
-    "session": { 这里粘贴 workbuddy-desktop.info 的完整 JSON 对象 }
+    "token": "短信登录拿到的 AT",
+    "uid": "短信登录拿到的 UID",
+    "refresh_token": "短信登录拿到的 RT（配了就启用自动续期）"
   },
   {
     "name": "小号",
-    "token": "该账号 auth.accessToken 的值",
-    "uid": "该账号 account.uid 的值",
-    "refresh_token": "可选，auth.refreshToken 的值（配了就启用自动续期）",
-    "enterpriseId": "可选，企业 ID",
-    "domain": "可选",
-    "endpoint": "可选，默认 https://copilot.tencent.com"
+    "token": "...",
+    "uid": "...",
+    "refresh_token": "..."
   }
 ]
 ```
@@ -167,7 +170,7 @@ Cloudflare 单个 Secret 上限 10KB，账号多了 `WORKBUDDY_ACCOUNTS` 会存�
 
 | 变量名 | 值 |
 |---|---|
-| `WORKBUDDY_ACCOUNT_1` | `{"name":"主号","session":{ info 文件完整 JSON }}` |
+| `WORKBUDDY_ACCOUNT_1` | `{"name":"主号","token":"...","uid":"...","refresh_token":"..."}` |
 | `WORKBUDDY_ACCOUNT_2` | `{"name":"小号","token":"...","uid":"...","refresh_token":"..."}` |
 | `WORKBUDDY_ACCOUNT_3` | 第三个账号…… |
 
@@ -178,12 +181,12 @@ Cloudflare 单个 Secret 上限 10KB，账号多了 `WORKBUDDY_ACCOUNTS` 会存�
 要点：
 
 - `name` 是日志和结果页里显示的账号名，自取；缺省时取账号昵称，再缺省为「账号N」。重名会自动加序号。
-- `session` 字段也允许直接放一整段 **JSON 字符串**（即把凭据文件内容再包一层引号、转义后粘贴）；嫌转义麻烦就用第二种 `token + uid` 写法。
-- **`refresh_token`（可选）**：配置后启用 Token 自动续期，脚本会自动刷新 AT，基本不用再手动更新凭据。用 `session` 完整 JSON 写法时无需额外配置——`workbuddy-desktop.info` 里自带 `auth.refreshToken`，脚本会自动提取。用 `token + uid` 简化写法时需手动加此字段。详见 [Token 自动续期](#token-自动续期refresh-token)。
+- **`refresh_token`（可选）**：配置后启用 Token 自动续期，脚本会自动刷新 AT，基本不用再手动更新凭据。详见 [Token 自动续期](#token-自动续期refresh-token)。
 - 每个账号的 token 独立做到期预警；某个账号配置写错或登录失效，**不影响其他账号**，结果页/日志里该账号单独标红。
 - 配置了多账号变量后，单账号的 `WORKBUDDY_SESSION` / `WORKBUDDY_TOKEN` 会被忽略；改回单账号直接删掉多账号变量即可。
 - 只想手动调试某一个账号：URL 加 `?account=账号名`，例如 `/auto?account=主号`。
 - 首页账号列表中，已配置 RT 的账号会显示绿色「自动续期」徽章，未配置的显示灰色「未配续期」。
+- 旧版桌面端（info 文件未加密）仍支持 `session` 字段写法（粘贴完整 info JSON），与 `token + uid` 写法可混用。
 
 > 升级提示：运行记录改为**每次运行写一个独立 key**（避免定时任务与手动触发并发时互相覆盖），写入后自动裁剪为最近 30 条。旧版单 key 的历史日志无需手动清理，在新记录产生前仍会被正常渲染。
 
