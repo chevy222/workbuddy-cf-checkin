@@ -118,12 +118,12 @@ C:\Users\<你的用户名>\AppData\Local\CodeBuddyExtension\Data\Public\auth\wor
 
 | 变量名 | 值 |
 |---|---|
-| `WORKBUDDY_TOKEN` | 凭据文件里 `auth.accessToken` 的值 |
-| `WORKBUDDY_UID` | 凭据文件里 `account.uid` 的值 |
+| `WORKBUDDY_TOKEN` | 凭据文件里 `auth.accessToken` 的值（新版格式是 `{"$wbEncrypted":1,"envelope":"..."}` 对象，取其中 `envelope` 字段的实际 token 字符串） |
+| `WORKBUDDY_UID` | 凭据文件里 `account.uid` 的值（纯数字/字符串，没有 envelope） |
 
 企业账号可再加 `WORKBUDDY_ENTERPRISE_ID`；两种方案二选一，同时配置时以 `WORKBUDDY_SESSION` 优先。
 
-> 如需启用 **Token 自动续期**，简化方案还需再加一个 Secret `WORKBUDDY_REFRESH_TOKEN`（值为凭据文件里 `auth.refreshToken`）。用完整 `WORKBUDDY_SESSION` 方案时无需额外配置，文件里自带 RT。
+> 如需启用 **Token 自动续期**，简化方案还需再加一个 Secret `WORKBUDDY_REFRESH_TOKEN`（值为凭据文件里 `auth.refreshToken`，新版格式同样取 `envelope` 字段里的实际 token）。用完整 `WORKBUDDY_SESSION` 方案时无需额外配置，文件里自带 RT，脚本会自动解包。
 
 ### 3. 验证
 
