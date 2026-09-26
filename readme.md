@@ -101,7 +101,9 @@ C:\Users\<你的用户名>\AppData\Local\CodeBuddyExtension\Data\Public\auth\wor
 
 打开后是一段 JSON。`Ctrl + A` 全选 → `Ctrl + C` 复制。**只有一个账号**时按下节配置即可；**多个账号**直接看 [多账号配置](#多账号配置)。
 
-> **新版桌面端格式说明**：较新版本的 WorkBuddy 桌面端会把 `accessToken` / `refreshToken` 包成 `{"$wbEncrypted":1,"envelope":"实际token"}` 的形式（token 明文在 `envelope` 字段里，并非真加密）。脚本已自动兼容两种格式，直接整段复制粘贴即可，无需手动解包。
+> **新版桌面端格式说明**：较新版本的 WorkBuddy 桌面端会把 `auth.accessToken` 和 `auth.refreshToken` 包成 `{"$wbEncrypted":1,"envelope":"实际token"}` 的形式（token 明文在 `envelope` 字段里，并非真加密）。脚本已自动兼容两种格式，直接整段复制粘贴即可，无需手动解包。
+>
+> 注意：只有 `auth.accessToken` 和 `auth.refreshToken` 有这个包装；`account.uid`、`account.nickname`、`account.enterpriseId` 等其他字段仍然是普通值，没有 envelope。
 
 ### 2. 配置到 Worker 的 Secret（单账号）
 
