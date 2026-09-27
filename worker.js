@@ -60,7 +60,7 @@
 // 日期（yyyymmdd）+ 当天第几次改动。当天第几个改动就写几；
 // 跨天则换成当天日期、序号从 1 重新开始。页脚会显示它——配合自动部署时，
 // 刷新页面看这一行变没变，就知道新版本上线没有。
-const BUILD_VERSION = "20260927:2";
+const BUILD_VERSION = "20260927:3";
 
 const DEFAULT_ENDPOINT = "https://copilot.tencent.com";
 
@@ -230,7 +230,11 @@ function jwtExp(token) {
   try {
     const parts = String(token).split(".");
     if (parts.length < 2) return 0;
-    return Number(JSON.parse(atob(parts[1].replace(/-/g, "+").replace(/_/g, "/"))).exp) || 0;
+    // base64url → base64 后必须补齐 padding：部分运行时的 atob 对长度非 4 倍数的输入直接抛错，
+    // 解析失败会退化成「每次运行都尝试续期」（见 ensureFreshToken 的 curExp === 0 分支）
+    let payload = parts[1].replace(/-/g, "+").replace(/_/g, "/");
+    payload += "=".repeat((4 - (payload.length % 4)) % 4);
+    return Number(JSON.parse(atob(payload)).exp) || 0;
   } catch (e) { return 0; }
 }
 
