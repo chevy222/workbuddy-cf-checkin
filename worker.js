@@ -60,7 +60,7 @@
 // 日期（yyyymmdd）+ 当天第几次改动。当天第几个改动就写几；
 // 跨天则换成当天日期、序号从 1 重新开始。页脚会显示它——配合自动部署时，
 // 刷新页面看这一行变没变，就知道新版本上线没有。
-const BUILD_VERSION = "20260927:3";
+const BUILD_VERSION = "20260927:4";
 
 const DEFAULT_ENDPOINT = "https://copilot.tencent.com";
 
@@ -189,7 +189,8 @@ function buildAccount(conf, index, env) {
 
   const headers = buildHeaders(session); // 缺 token/uid 时在此抛错
   const endpoint = ((session.auth || {}).endpoint || conf.endpoint || env.WORKBUDDY_ENDPOINT || DEFAULT_ENDPOINT).replace(/\/+$/, "");
-  const tokenInfo = inspectToken(unwrapToken(session.auth.accessToken));
+  const accessToken = unwrapToken(session.auth.accessToken);
+  const tokenInfo = inspectToken(accessToken);
   const acc = (session.account || {});
   const fallbackName = acc.nickname || acc.name || ("账号" + (index + 1));
   // refreshToken 来自 session（info 文件自带 auth.refreshToken）或 conf.refresh_token；新版可能是包装对象，需解包
@@ -197,7 +198,7 @@ function buildAccount(conf, index, env) {
   return {
     name: conf.name ? String(conf.name) : String(fallbackName),
     uid: String(acc.uid || ""),
-    headers, endpoint, tokenInfo, refreshToken,
+    headers, endpoint, accessToken, tokenInfo, refreshToken,
   };
 }
 
@@ -254,8 +255,9 @@ const expireDateOf = (tokenInfo) => new Date(tokenInfo.expireAt).toISOString().s
 // 满足刷新条件（AT 临期 或 距上次刷新过久）时调刷新接口，结果写回 KV。
 // 返回 { headers, note, accessToken }，accessToken 为当前实际使用的 AT（供调用方重算 tokenInfo）。
 async function ensureFreshToken(account, env) {
-  const envAT = (account.headers && account.headers["Authorization"]) ?
-    account.headers["Authorization"].replace(/^Bearer\s+/i, "") : "";
+  // 当前 AT 由 buildAccount 解析后直接带在账号对象上，不再从 Authorization 头反解
+  // （反解要依赖头部拼接格式，且 headersWith 的「是否同一份 AT」判断变成字符串还原比对）
+  const envAT = account.accessToken;
   const envRT = account.refreshToken;
   const envExp = jwtExp(envAT);
   const nowSec = Math.floor(Date.now() / 1000);
