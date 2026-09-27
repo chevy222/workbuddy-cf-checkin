@@ -60,7 +60,7 @@
 // 日期（yyyymmdd）+ 当天第几次改动。当天第几个改动就写几；
 // 跨天则换成当天日期、序号从 1 重新开始。页脚会显示它——配合自动部署时，
 // 刷新页面看这一行变没变，就知道新版本上线没有。
-const BUILD_VERSION = "20260927:5";
+const BUILD_VERSION = "20260927:6";
 
 const DEFAULT_ENDPOINT = "https://copilot.tencent.com";
 
@@ -476,6 +476,20 @@ function dig(obj, key) {
   return null;
 }
 
+// 数字字段归一：接口可能把数字给成字符串、也可能缺字段，NaN/空一律按 0 计
+const digNum = (obj, key) => Number(dig(obj, key)) || 0;
+
+// 依次探测多组 [对象, 字段名]，取第一个非 0 的数字：
+// 不同接口版本把积分挂在 credit_amount / credit / reward_credit 等不同字段上，只能逐个试。
+// 某项取到 0 / 非数字时继续试下一项（与原 `a || b || c` 的探测语义一致）。
+function firstNum(pairs) {
+  for (const [obj, key] of pairs) {
+    const n = digNum(obj, key);
+    if (n) return n;
+  }
+  return 0;
+}
+
 function fmtCredit(v) {
   const n = Number(v);
   return (v !== null && v !== undefined && v !== "" && Number.isFinite(n)) ? Math.trunc(n) : v;
@@ -493,12 +507,22 @@ function isAlreadyCheckedIn(body) {
   return false;
 }
 
+// 状态接口的字段抽取：已签（alreadyReport）与刚领取（CLAIMED）两条路径共用，
+// 原先同一批 dig 写了两遍，且两处对 streak_days 的回退策略还不一致。
+// fallback 供「领取后补拉状态」用：补拉成功但缺字段时退回领取前那份，避免显示成空白。
+function pickStatus(status, fallback = null) {
+  const pick = (key) => dig(status, key) ?? (fallback ? dig(fallback, key) : null);
+  return {
+    todayCredit: dig(status, "today_credit") ?? dig(status, "daily_credit"),
+    streakDays: pick("streak_days"),
+    totalCredits: pick("total_credits"),
+    isStreakDay: pick("is_streak_day"),
+    nextStreakDay: pick("next_streak_day"),
+  };
+}
+
 function alreadyReport(status, via = null) {
-  const todayCredit = dig(status, "today_credit") ?? dig(status, "daily_credit");
-  const streakDays = dig(status, "streak_days");
-  const totalCredits = dig(status, "total_credits");
-  const isStreakDay = dig(status, "is_streak_day");
-  const nextStreakDay = dig(status, "next_streak_day");
+  const { todayCredit, streakDays, totalCredits, isStreakDay, nextStreakDay } = pickStatus(status);
   const inner = [];
   if (todayCredit !== null) inner.push("今日 +" + fmtCredit(todayCredit));
   if (streakDays !== null) inner.push("连续 " + streakDays + " 天");
@@ -585,7 +609,7 @@ async function stepTravel(ctx) {
 async function stepLottery(ctx) {
   const { base, headers, parts } = ctx;
   const chancesResp = await ctx.get(base + "/lottery/chances", headers);
-  const chances = is2xx(chancesResp.status) ? (dig(chancesResp.body, "balance") || 0) : 0;
+  const chances = is2xx(chancesResp.status) ? digNum(chancesResp.body, "balance") : 0;
   if (chances <= 0) return;
 
   const prizes = await repeatPost(Math.min(chances, 10), async () => {
@@ -595,7 +619,7 @@ async function stepLottery(ctx) {
       return null;
     }
     // 抽奖可能产积分（credit_amount / credit / reward_credit），累加到合计
-    const credit = Number(dig(drawResp.body, "credit_amount") || dig(drawResp.body, "credit") || dig(drawResp.body, "reward_credit")) || 0;
+    const credit = firstNum([[drawResp.body, "credit_amount"], [drawResp.body, "credit"], [drawResp.body, "reward_credit"]]);
     if (credit) ctx.credits += credit;
     return dig(drawResp.body, "prize_name") || dig(drawResp.body, "name") || "未知";
   });
@@ -607,7 +631,7 @@ async function stepLottery(ctx) {
 async function stepBlindbox(ctx) {
   const { base, headers, parts } = ctx;
   const quotaResp = await ctx.get(base + "/buddy/quota", headers);
-  const affordable = Number(is2xx(quotaResp.status) ? dig(quotaResp.body, "affordable") : 0) || 0;
+  const affordable = is2xx(quotaResp.status) ? digNum(quotaResp.body, "affordable") : 0;
   if (affordable <= 0) return;
 
   const items = await repeatPost(Math.min(affordable, 5), async () => {
@@ -620,8 +644,10 @@ async function stepBlindbox(ctx) {
     const instance = item.instance || {};
     const template = item.template || {};
     // 盲盒可能产积分，data 层与 item 各层都试一遍
-    const credit = Number(dig(openResp.body, "credit_amount") || dig(openResp.body, "credit_granted") || dig(openResp.body, "reward_credit")
-      || dig(item, "credit") || dig(instance, "credit") || dig(template, "credit")) || 0;
+    const credit = firstNum([
+      [openResp.body, "credit_amount"], [openResp.body, "credit_granted"], [openResp.body, "reward_credit"],
+      [item, "credit"], [instance, "credit"], [template, "credit"],
+    ]);
     if (credit) ctx.credits += credit;
     return (instance.name || template.name || "?") + "(" + (instance.rarity || template.rarity || "?") + ")";
   });
@@ -681,9 +707,9 @@ async function stepRedeem(ctx) {
     if (dig(redeemResp.body, "code") !== 0) continue; // 409=已兑换过，403=天数不足，静默不刷屏
 
     const got = [];
-    const credit = Number(dig(redeemResp.body, "credit_granted")) || 0;
-    const energy = Number(dig(redeemResp.body, "energy_granted")) || 0;
-    const chances = Number(dig(redeemResp.body, "chances_granted")) || 0;
+    const credit = digNum(redeemResp.body, "credit_granted");
+    const energy = digNum(redeemResp.body, "energy_granted");
+    const chances = digNum(redeemResp.body, "chances_granted");
     if (credit) { ctx.credits += credit; got.push("+" + credit + "积分"); }
     if (energy) got.push("+" + energy + "能量");
     if (chances) got.push("+" + chances + "抽奖");
@@ -808,15 +834,12 @@ async function runAuto(headers, endpoint) {
   const credit = dig(c.body, "credit");
   if (credit !== null) {
     const fresh = await refetchStatus(endpoint, headers, status);
-    // 用 ?? 而非 ||：streak_days 为 0 时不应回退；字段整体缺失时为 null
-    const streakDays = dig(fresh, "streak_days") ?? dig(status, "streak_days");
-    const totalCredits = dig(fresh, "total_credits");
-    const isStreakDay = dig(fresh, "is_streak_day");
-    const nextStreakDay = dig(fresh, "next_streak_day");
+    // 补拉失败时 refetchStatus 会把领取前那份 status 退回来，pickStatus 的 fallback 再兜一层
+    const { streakDays, totalCredits, isStreakDay, nextStreakDay } = pickStatus(fresh, status);
     // 各片段缺失时不输出，避免出现「连续 null 天」
     const tails = [];
     if (isStreakDay) tails.push("且为连签奖励日");
-    if (streakDays !== null && streakDays !== undefined) tails.push("连续 " + streakDays + " 天");
+    if (streakDays !== null) tails.push("连续 " + streakDays + " 天");
     if (totalCredits !== null) tails.push("累计 " + fmtCredit(totalCredits) + " 积分");
     const report = "成功领取 " + fmtCredit(credit) + " 积分" + (tails.length ? "（" + tails.join("，") + "）" : "");
     return {
