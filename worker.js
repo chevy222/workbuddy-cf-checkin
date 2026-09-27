@@ -760,14 +760,15 @@ async function runGrowth(headers, endpoint) {
   // 兑换依赖 stepEnergyStreak 写入的 streakDays，放在并发之后
   await stepRedeem(ctx);
 
-  // 全部请求失败（上游宕机/网络异常）时返回 ERROR，不与"今天没东西可领"混淆
-  if (stats.failed === stats.total) {
-    return { code: 1, out: { result: "ERROR", report: "成长中心全部请求失败（" + stats.failed + "/" + stats.total + "），上游服务可能异常" } };
-  }
-  // 鉴权失败集中判定：所有成长中心接口的 401/403 都计入 stats.auth，
-  // 失效登录态不能被误报成「成长中心无可领取项」
+  // 鉴权失败优先于「全部失败」判定：成长中心接口全为 401/403 时，最可能的原因是
+  // 登录态失效（提示重新登录），报 ERROR「上游异常」会把排查方向带偏。
+  // 部分成功 + 失败全为鉴权错时也命中本条，失效登录态不能被误报成「无可领取项」。
   if (stats.auth > 0 && stats.auth === stats.failed) {
     return { code: 1, out: { result: "NO_SESSION", report: "成长中心登录态已失效，请重新登录 WorkBuddy 桌面端" } };
+  }
+  // 其余的全部请求失败（上游宕机/网络异常/混合错误）返回 ERROR，不与"今天没东西可领"混淆
+  if (stats.failed === stats.total) {
+    return { code: 1, out: { result: "ERROR", report: "成长中心全部请求失败（" + stats.failed + "/" + stats.total + "），上游服务可能异常" } };
   }
 
   const { parts, credits, energy, streakDays } = ctx;
