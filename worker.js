@@ -55,7 +55,7 @@
 // 日期（yyyymmdd）+ 当天第几次改动。当天第几个改动就写几；
 // 跨天则换成当天日期、序号从 1 重新开始。页脚会显示它——配合自动部署时，
 // 刷新页面看这一行变没变，就知道新版本上线没有。
-const BUILD_VERSION = "20260926:1";
+const BUILD_VERSION = "20260927:1";
 
 const DEFAULT_ENDPOINT = "https://copilot.tencent.com";
 
@@ -87,6 +87,10 @@ function post(url, headers, payload = null) {
 function get(url, headers) {
   return request(url, headers, "GET");
 }
+
+// 保存全局 get/post 引用，供 runGrowth 内部 shadow 时调用（避免 const TDZ 问题）
+const _globalGet = get;
+const _globalPost = post;
 
 /* ---------- 凭据：单账号头部构建 / 多账号解析 ---------- */
 
@@ -485,10 +489,11 @@ async function runGrowth(headers, endpoint) {
   let creditsGained = 0;
   // 请求成功率统计：shadow 全局 get/post，自动计数。
   // 全部请求失败时返回 ERROR，避免上游宕机被静默判为"成长中心无可领取项"。
+  // 注意：全局引用必须在函数外保存（_globalGet/_globalPost），
+  // 不能在本函数内写 const _g = get —— const get 的 TDZ 会让 get 指向未初始化的局部变量。
   let reqTotal = 0, reqFailed = 0;
-  const _g = get, _p = post;
-  const get = async (url, h) => { reqTotal++; const r = await _g(url, h); if (r.status < 200 || r.status >= 300) reqFailed++; return r; };
-  const post = async (url, h, body) => { reqTotal++; const r = await _p(url, h, body); if (r.status < 200 || r.status >= 300) reqFailed++; return r; };
+  const get = async (url, h) => { reqTotal++; const r = await _globalGet(url, h); if (r.status < 200 || r.status >= 300) reqFailed++; return r; };
+  const post = async (url, h, body) => { reqTotal++; const r = await _globalPost(url, h, body); if (r.status < 200 || r.status >= 300) reqFailed++; return r; };
 
   // --- 1. Buddy 旅行：领礼物 + 派出发 ---
   const s = await get(base + "/buddy/travel/status", headers);
