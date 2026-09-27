@@ -60,7 +60,7 @@
 // 日期（yyyymmdd）+ 当天第几次改动。当天第几个改动就写几；
 // 跨天则换成当天日期、序号从 1 重新开始。页脚会显示它——配合自动部署时，
 // 刷新页面看这一行变没变，就知道新版本上线没有。
-const BUILD_VERSION = "20260927:9";
+const BUILD_VERSION = "20260927:10";
 
 const DEFAULT_ENDPOINT = "https://copilot.tencent.com";
 
@@ -951,7 +951,11 @@ async function runOne(account, action, trigger, env) {
         if (r.code === 0) {
           const g = await runGrowth(headers, endpoint);
           r.out.growth = g.out.report;
-          if (g.out.credits_gained) r.out.report += "；" + g.out.report;
+          // 成长中心自身的成败单独透出：顶层 result 仍按签到链路（CLAIMED/ALREADY）不变，
+          // 监控可凭 growth_result 察觉签到正常但成长中心全挂（ERROR/NO_SESSION）的情况
+          r.out.growth_result = g.out.result;
+          // 始终拼接：成长中心跑通但零积分、或全部失败时，其结果不再被吞进顶层 report 之外
+          r.out.report += "；" + g.out.report;
         }
         break;
       }
