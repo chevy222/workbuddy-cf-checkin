@@ -20,11 +20,16 @@
  *                             "enterpriseId":"可选","domain":"可选","endpoint":"可选"}
  *                          ]
  *                          其中 session 也允许是整段 JSON 字符串；name 缺省取账号昵称或"账号N"。
+ *   WORKBUDDY_ACCOUNT_<N>  多账号另一种方式：每个账号一个独立 Secret（JSON 对象），
+ *                          序号决定执行顺序。用于账号多、单 Secret 超 5KB 上限时。
+ *                          配了 ACCOUNTS 或 ACCOUNT_<N> 时，单账号变量会被忽略。
  *   WORKBUDDY_SESSION      单账号：workbuddy-desktop.info 的完整 JSON 内容（兼容旧配置）
  *   WORKBUDDY_TOKEN + WORKBUDDY_UID   单账号简化替代
+ *   WORKBUDDY_REFRESH_TOKEN           可选；配了即启用 Refresh Token 自动续期
  *   WORKBUDDY_ENTERPRISE_ID / WORKBUDDY_DOMAIN / WORKBUDDY_ENDPOINT  单账号可选项
  *   WORKER_SECRET          可选；设置后需以 ?key=xxx 或请求头 X-Worker-Key 访问（含首页）
- *   KV 绑定（变量名 KV）    可选；保存最近 30 次运行记录，/logs 查看
+ *   KV 绑定（变量名 KV）    可选；保存最近 30 次运行记录（/logs 查看）、Cron 心跳、
+ *                          并发锁，以及各账号的 AT/RT 续期状态（自动续期必需）
  *
  * 多账号：
  *   - Cron 触发时依次执行全部账号的 auto（签到 + 成长中心），结果聚合为一条运行记录；
@@ -55,48 +60,73 @@
 // 日期（yyyymmdd）+ 当天第几次改动。当天第几个改动就写几；
 // 跨天则换成当天日期、序号从 1 重新开始。页脚会显示它——配合自动部署时，
 // 刷新页面看这一行变没变，就知道新版本上线没有。
-const BUILD_VERSION = "20260927:1";
+const BUILD_VERSION = "20260927:2";
 
 const DEFAULT_ENDPOINT = "https://copilot.tencent.com";
 
+/* ---------- 令牌续期参数 ---------- */
+// 集中放在文件前部：下面的 TOKEN_WARN_DAYS 由 REFRESH_BEFORE_EXPIRE_SEC 推导，
+// 若声明在使用点之后会撞上 const 的暂时性死区，模块加载即报错。
+
+// Refresh Token 续期状态：按 uid 分 key，存最新 AT/RT 与上次刷新时间。
+// 与环境变量里的初始凭据配合——谁的 AT 更新（exp 更晚）就用谁的，刷新结果统一落 KV。
+const RT_STORE_PREFIX = "signin:rt:";
+const REFRESH_URL = "https://copilot.tencent.com/v2/plugin/auth/token/refresh";
+const REFRESH_INTERVAL_SEC = 10 * 86400; // 距上次刷新超过 10 天则续期
+const REFRESH_BEFORE_EXPIRE_SEC = 7 * 86400; // AT 剩余不足 7 天则续期
+
 /* ---------- HTTP 基础（对应 Python 的 _request/post/get） ---------- */
 
-async function request(url, headers, method = "GET", payload = null) {
-  const init = { method, headers, signal: AbortSignal.timeout(30000) };
-  if (payload !== null && payload !== undefined) init.body = JSON.stringify(payload);
+// 2xx 判定：原先散落 13 处 `status >= 200 && status < 300`，统一走这里
+const is2xx = (status) => status >= 200 && status < 300;
+
+// 统一的 fetch + JSON 解析骨架：非 JSON 响应兜底成 {raw}，网络异常/超时兜底成 status -1。
+// rawLimit 控制非 JSON 时的截断长度，timeoutMsg 控制超时的提示文案。
+// 注意：AbortSignal 必须在每次调用内新建，提到模块级复用会在 30s 后让后续请求全部立即超时。
+async function fetchJson(url, init, rawLimit, timeoutMsg) {
   try {
-    const resp = await fetch(url, init);
+    const resp = await fetch(url, { ...init, signal: AbortSignal.timeout(30000) });
     const raw = await resp.text();
-    let body;
     try {
-      body = JSON.parse(raw);
+      return { status: resp.status, body: JSON.parse(raw) };
     } catch (e) {
-      body = { raw: String(raw).slice(0, 500) };
+      return { status: resp.status, body: { raw: String(raw).slice(0, rawLimit) } };
     }
-    return { status: resp.status, body };
   } catch (e) {
-    const reason = e && e.name === "AbortError" ? "请求超时(30s)" : String((e && e.message) || e);
+    const reason = e && e.name === "AbortError" ? timeoutMsg : String((e && e.message) || e);
     return { status: -1, body: { error: reason } };
   }
+}
+
+// stats 非空时顺带累计请求成败，供 runGrowth 区分「上游全挂」与「登录态失效」。
+// 计数放在这一层，调用方就不必 shadow 同名 get/post（那会逼出绕开 TDZ 的全局别名写法）。
+async function request(url, headers, method = "GET", payload = null, stats = null) {
+  const init = { method, headers };
+  if (payload !== null && payload !== undefined) init.body = JSON.stringify(payload);
+  const resp = await fetchJson(url, init, 500, "请求超时(30s)");
+  if (stats) {
+    stats.total++;
+    if (!is2xx(resp.status)) stats.failed++;
+    if (resp.status === 401 || resp.status === 403) stats.auth++;
+  }
+  return resp;
 }
 
 function post(url, headers, payload = null) {
   return request(url, headers, "POST", payload);
 }
 
-function get(url, headers) {
-  return request(url, headers, "GET");
+// 幂等键：抽奖与连签兑换靠 client_token 让服务端判重，避免重试时重复扣次数/重复发奖。
+// 用 crypto.randomUUID 而非 Math.random——幂等键一旦冲突，服务端会当重复请求丢弃奖励。
+function clientToken(prefix) {
+  return prefix + "-" + crypto.randomUUID().replace(/-/g, "").slice(0, 16);
 }
-
-// 保存全局 get/post 引用，供 runGrowth 内部 shadow 时调用（避免 const TDZ 问题）
-const _globalGet = get;
-const _globalPost = post;
 
 /* ---------- 凭据：单账号头部构建 / 多账号解析 ---------- */
 
 // 统一构造"带结果码"的错误，让调用方区分配置错误 / 账号不存在 / 登录失效。
 // 避免所有异常都被笼统报成 NO_SESSION——用户看到"登录失效"会去重新登录，白折腾一趟。
-function fail(result, message) {
+function taggedError(result, message) {
   const e = new Error(message);
   e.result = result;
   return e;
@@ -116,7 +146,7 @@ function buildHeaders(session) {
   const token = unwrapToken(auth.accessToken);
   const uid = account.uid;
   if (!token || !uid) {
-    throw fail("CONFIG_ERROR", "会话凭据中缺少 accessToken 或 uid");
+    throw taggedError("CONFIG_ERROR", "会话凭据中缺少 accessToken 或 uid");
   }
   const headers = {
     "Accept": "application/json",
@@ -175,40 +205,46 @@ function buildAccount(conf, index, env) {
 
 // 调刷新接口，用 RT 换新 AT + 新 RT。返回 {at, rt} 或 {error}。
 async function refreshAccessToken(rt) {
-  try {
-    const resp = await fetch(REFRESH_URL, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "X-Refresh-Token": rt,
-        "X-Auth-Refresh-Source": "plugin",
-      },
-      body: "{}",
-      signal: AbortSignal.timeout(30000),
-    });
-    const raw = await resp.text();
-    let body;
-    try { body = JSON.parse(raw); } catch (e) { body = { raw: raw.slice(0, 300) }; }
-    const data = (body && body.data) || {};
-    if (body && body.code === 0 && data.accessToken) {
-      return { at: data.accessToken, rt: data.refreshToken || rt };
-    }
-    return { error: (body && body.msg) || ("HTTP " + resp.status) };
-  } catch (e) {
-    const reason = e && e.name === "AbortError" ? "刷新请求超时(30s)" : String((e && e.message) || e);
-    return { error: reason };
+  const resp = await fetchJson(REFRESH_URL, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "X-Refresh-Token": rt,
+      "X-Auth-Refresh-Source": "plugin",
+    },
+    body: "{}",
+  }, 300, "刷新请求超时(30s)");
+
+  if (resp.status === -1) return { error: resp.body.error }; // 网络异常/超时，body 里已带原因
+  const body = resp.body;
+  const data = (body && body.data) || {};
+  if (body && body.code === 0 && data.accessToken) {
+    return { at: data.accessToken, rt: data.refreshToken || rt };
   }
+  return { error: (body && body.msg) || ("HTTP " + resp.status) };
 }
 
-// 从 JWT 解析 exp（秒），解析失败返回 0
-function tokenExpireAt(token) {
+// 解析 JWT 的 exp（秒），解析失败返回 0。
+// 不校验签名——签名只对签发方有意义，这里只读 exp 做续期判断与到期预警。
+function jwtExp(token) {
   try {
     const parts = String(token).split(".");
     if (parts.length < 2) return 0;
-    const payload = JSON.parse(atob(parts[1].replace(/-/g, "+").replace(/_/g, "/")));
-    return Number(payload.exp) || 0;
+    return Number(JSON.parse(atob(parts[1].replace(/-/g, "+").replace(/_/g, "/"))).exp) || 0;
   } catch (e) { return 0; }
 }
+
+// 令牌状态：给报告用（临期/过期预警），也给首页账号列表用。解析不出 exp 时返回 null。
+function inspectToken(token) {
+  const exp = jwtExp(token);
+  if (!exp) return null;
+  const msLeft = exp * 1000 - Date.now();
+  if (msLeft <= 0) return { daysLeft: 0, expired: true, expireAt: exp * 1000 };
+  return { daysLeft: Math.floor(msLeft / 86400000), expired: false, expireAt: exp * 1000 };
+}
+
+// 令牌到期日（UTC），日志与首页展示共用一处格式
+const expireDateOf = (tokenInfo) => new Date(tokenInfo.expireAt).toISOString().slice(0, 10);
 
 // 续期主逻辑：比较环境变量 AT 与 KV 中 AT 的 exp，选更新的；
 // 满足刷新条件（AT 临期 或 距上次刷新过久）时调刷新接口，结果写回 KV。
@@ -217,7 +253,7 @@ async function ensureFreshToken(account, env) {
   const envAT = (account.headers && account.headers["Authorization"]) ?
     account.headers["Authorization"].replace(/^Bearer\s+/i, "") : "";
   const envRT = account.refreshToken;
-  const envExp = tokenExpireAt(envAT);
+  const envExp = jwtExp(envAT);
   const nowSec = Math.floor(Date.now() / 1000);
 
   // 从 KV 读续期状态
@@ -226,19 +262,20 @@ async function ensureFreshToken(account, env) {
   let curRT = envRT;
   let refreshedAt = 0;
   let refreshCount = 0;
-  let source = "env";
 
   if (kv && kv.access_token && kv.refresh_token) {
-    const kvExp = tokenExpireAt(kv.access_token);
+    const kvExp = jwtExp(kv.access_token);
     // KV 里的 AT 更新（exp 更晚）→ 用 KV 的整套凭据
     if (kvExp > envExp) {
       curAT = kv.access_token;
       curRT = kv.refresh_token;
       refreshedAt = Number(kv.refreshed_at) || 0;
       refreshCount = Number(kv.refresh_count) || 0;
-      source = "kv";
     }
   }
+
+  // 用指定 AT 重建 headers；与当前一致时直接沿用原对象，避免无谓的浅拷贝
+  const headersWith = (at) => (at === envAT ? account.headers : { ...account.headers, "Authorization": "Bearer " + at });
 
   // 没有 RT 就无法续期，直接返回现有 headers
   if (!curRT) {
@@ -246,28 +283,21 @@ async function ensureFreshToken(account, env) {
   }
 
   // 判断是否需要刷新
-  const curExp = tokenExpireAt(curAT);
+  const curExp = jwtExp(curAT);
   const needRefresh = (curExp > 0 && (curExp - nowSec) < REFRESH_BEFORE_EXPIRE_SEC) ||
     (refreshedAt > 0 && (nowSec - refreshedAt) > REFRESH_INTERVAL_SEC) ||
     (curExp === 0); // AT 解析不出 exp 时也尝试刷新
 
+  // 不需要刷新：仅在来源是 KV（AT 比环境变量新）时用 KV 的 AT 重建 headers
   if (!needRefresh) {
-    // 不需要刷新，但如果来源是 KV（AT 比环境变量新），需要用 KV 的 AT 重建 headers
-    if (source === "kv" && curAT !== envAT) {
-      const newHeaders = { ...account.headers, "Authorization": "Bearer " + curAT };
-      return { headers: newHeaders, note: "", accessToken: curAT };
-    }
-    return { headers: account.headers, note: "", accessToken: envAT };
+    return { headers: headersWith(curAT), note: "", accessToken: curAT };
   }
 
   // 执行刷新
   const result = await refreshAccessToken(curRT);
   if (result.error) {
     // 刷新失败：仍用旧 AT 尝试，report 里给警告
-    const note = "⚠️令牌续期失败（" + result.error + "）";
-    const headers = (source === "kv" && curAT !== envAT) ?
-      { ...account.headers, "Authorization": "Bearer " + curAT } : account.headers;
-    return { headers, note, accessToken: curAT };
+    return { headers: headersWith(curAT), note: "⚠️令牌续期失败（" + result.error + "）", accessToken: curAT };
   }
 
   // 刷新成功：写回 KV，用新 AT 重建 headers
@@ -278,18 +308,17 @@ async function ensureFreshToken(account, env) {
     refreshed_at: nowSec,
     refresh_count: refreshCount + 1,
   });
-  const newHeaders = { ...account.headers, "Authorization": "Bearer " + result.at };
-  return { headers: newHeaders, note: "🔄令牌已自动续期", accessToken: result.at };
+  return { headers: headersWith(result.at), note: "🔄令牌已自动续期", accessToken: result.at };
 }
 
 // 解析出本次要执行的账号列表；配置非法时抛错，单个账号非法时该账号带 error 字段，不影响其他账号
 // 支持三种配置方式（可混用）：
 //   1. WORKBUDDY_ACCOUNTS        —— JSON 数组，所有账号写在一个 Secret 里（账号少时方便）
-//   2. WORKBUDDY_ACCOUNT_1 / _2  —— 每个账号一个独立 Secret（账号多、单 Secret 超 10KB 上限时用）
+//   2. WORKBUDDY_ACCOUNT_1 / _2  —— 每个账号一个独立 Secret（账号多、单 Secret 超 5KB 上限时用）
 //   3. WORKBUDDY_SESSION 等       —— 单账号兼容
 function resolveAccounts(env, filterName) {
   const accounts = [];
-  const rawConfs = []; // {conf, source} 收集所有账号原始配置，统一解析
+  const rawConfs = []; // 收集所有账号的原始配置（ACCOUNTS 数组项与 ACCOUNT_N 各项），统一解析
 
   // 方式一：WORKBUDDY_ACCOUNTS 数组（兼容旧配置）
   if (env.WORKBUDDY_ACCOUNTS) {
@@ -297,15 +326,15 @@ function resolveAccounts(env, filterName) {
     try {
       arr = JSON.parse(env.WORKBUDDY_ACCOUNTS);
     } catch (e) {
-      throw fail("CONFIG_ERROR", "WORKBUDDY_ACCOUNTS 不是合法 JSON（需为数组，每项含 name 与 session 或 token+uid）");
+      throw taggedError("CONFIG_ERROR", "WORKBUDDY_ACCOUNTS 不是合法 JSON（需为数组，每项含 name 与 session 或 token+uid）");
     }
     if (!Array.isArray(arr) || !arr.length) {
-      throw fail("CONFIG_ERROR", "WORKBUDDY_ACCOUNTS 必须是非空 JSON 数组");
+      throw taggedError("CONFIG_ERROR", "WORKBUDDY_ACCOUNTS 必须是非空 JSON 数组");
     }
-    arr.forEach((conf) => rawConfs.push({ conf, source: "WORKBUDDY_ACCOUNTS" }));
+    arr.forEach((conf) => rawConfs.push(conf));
   }
 
-  // 方式二：WORKBUDDY_ACCOUNT_<N> 独立变量（每个账号一个 Secret，避开单 Secret 10KB 上限）
+  // 方式二：WORKBUDDY_ACCOUNT_<N> 独立变量（每个账号一个 Secret，避开单 Secret 5KB 上限）
   // 扫描所有以 WORKBUDDY_ACCOUNT_ 开头且后面跟数字的变量；WORKBUDDY_ACCOUNTS（复数）不在此列
   const indexedKeys = Object.keys(env)
     .filter((k) => /^WORKBUDDY_ACCOUNT_\d+$/.test(k))
@@ -317,16 +346,16 @@ function resolveAccounts(env, filterName) {
     try {
       conf = JSON.parse(val);
     } catch (e) {
-      throw fail("CONFIG_ERROR", key + " 不是合法 JSON（需为对象，含 name 与 session 或 token+uid）");
+      throw taggedError("CONFIG_ERROR", key + " 不是合法 JSON（需为对象，含 name 与 session 或 token+uid）");
     }
     if (!conf || typeof conf !== "object") {
-      throw fail("CONFIG_ERROR", key + " 必须是 JSON 对象");
+      throw taggedError("CONFIG_ERROR", key + " 必须是 JSON 对象");
     }
-    rawConfs.push({ conf, source: key });
+    rawConfs.push(conf);
   }
 
   if (rawConfs.length) {
-    rawConfs.forEach(({ conf }, i) => {
+    rawConfs.forEach((conf, i) => {
       try {
         accounts.push(buildAccount(conf, i, env));
       } catch (e) {
@@ -344,7 +373,7 @@ function resolveAccounts(env, filterName) {
       try {
         session = JSON.parse(env.WORKBUDDY_SESSION);
       } catch (e) {
-        throw fail("CONFIG_ERROR", "WORKBUDDY_SESSION 不是合法 JSON");
+        throw taggedError("CONFIG_ERROR", "WORKBUDDY_SESSION 不是合法 JSON");
       }
     } else if (env.WORKBUDDY_TOKEN && env.WORKBUDDY_UID) {
       session = {
@@ -356,7 +385,7 @@ function resolveAccounts(env, filterName) {
       if (env.WORKBUDDY_REFRESH_TOKEN) session.auth.refreshToken = env.WORKBUDDY_REFRESH_TOKEN;
     }
     if (!session) {
-      throw fail("CONFIG_ERROR",
+      throw taggedError("CONFIG_ERROR",
         "未配置登录凭据。请在 Worker 的 设置 → 变量和机密 中添加 Secret：" +
         "多账号用 WORKBUDDY_ACCOUNTS（JSON 数组）或 WORKBUDDY_ACCOUNT_1、WORKBUDDY_ACCOUNT_2（每号一个）；" +
         "单账号用 WORKBUDDY_SESSION（workbuddy-desktop.info 完整 JSON），或分别添加 WORKBUDDY_TOKEN 与 WORKBUDDY_UID。"
@@ -380,7 +409,7 @@ function resolveAccounts(env, filterName) {
   if (filterName) {
     const hit = accounts.filter((a) => a.name === filterName);
     if (!hit.length) {
-      throw fail("BAD_ACCOUNT", "找不到名为「" + filterName + "」的账号；当前已配置：" + accounts.map((a) => a.name).join("、"));
+      throw taggedError("BAD_ACCOUNT", "找不到名为「" + filterName + "」的账号；当前已配置：" + accounts.map((a) => a.name).join("、"));
     }
     return hit;
   }
@@ -389,25 +418,13 @@ function resolveAccounts(env, filterName) {
 
 /* ---------- 令牌到期预警 ---------- */
 
-// 解析 JWT payload（不校验签名——签名只对签发方有意义，这里只读 exp 做预警）
-function inspectToken(token) {
-  try {
-    const parts = String(token).split(".");
-    if (parts.length < 2) return null;
-    const payload = JSON.parse(atob(parts[1].replace(/-/g, "+").replace(/_/g, "/")));
-    if (!payload.exp) return null;
-    const msLeft = payload.exp * 1000 - Date.now();
-    if (msLeft <= 0) return { daysLeft: 0, expired: true, expireAt: payload.exp * 1000 };
-    return { daysLeft: Math.floor(msLeft / 86400000), expired: false, expireAt: payload.exp * 1000 };
-  } catch (e) {
-    return null; // 解析失败不影响正常签到
-  }
-}
-
 // 把令牌状态附到输出上；临期/过期时改写 result 并在 report 里给出醒目警告
+// 临期阈值与自动续期阈值共用同一个常量，改一处即可（7 天）
+const TOKEN_WARN_DAYS = REFRESH_BEFORE_EXPIRE_SEC / 86400;
+
 function applyTokenWarning(out, tokenInfo) {
   if (!tokenInfo) return out;
-  const expireDate = new Date(tokenInfo.expireAt).toISOString().slice(0, 10);
+  const expireDate = expireDateOf(tokenInfo);
   if (tokenInfo.expired) {
     return {
       ...out,
@@ -417,7 +434,7 @@ function applyTokenWarning(out, tokenInfo) {
       report: "【令牌已过期】" + out.report + "（请更新该账号的凭据 Secret）",
     };
   }
-  if (tokenInfo.daysLeft <= 7) {
+  if (tokenInfo.daysLeft <= TOKEN_WARN_DAYS) {
     return {
       ...out,
       token_days_left: tokenInfo.daysLeft,
@@ -431,10 +448,13 @@ function applyTokenWarning(out, tokenInfo) {
 
 /* ---------- 响应解析工具（与 Python 版一一对应） ---------- */
 
+// dig 会依次在这些包装层里找 key，提到模块级避免每次递归都新建数组
+const DIG_WRAPPERS = ["data", "result", "resp", "response"];
+
 function dig(obj, key) {
   if (obj && typeof obj === "object" && !Array.isArray(obj)) {
     if (key in obj && obj[key] !== null && obj[key] !== undefined) return obj[key];
-    for (const k of ["data", "result", "resp", "response"]) {
+    for (const k of DIG_WRAPPERS) {
       if (k in obj && obj[k] && typeof obj[k] === "object" && !Array.isArray(obj[k])) {
         const r = dig(obj[k], key);
         if (r !== null && r !== undefined) return r;
@@ -449,11 +469,14 @@ function fmtCredit(v) {
   return (v !== null && v !== undefined && v !== "" && Number.isFinite(n)) ? Math.trunc(n) : v;
 }
 
-function isAlreadyCheckedIn(cbody) {
-  if (cbody === null || cbody === undefined) return true;
-  if (typeof cbody === "object" && !Array.isArray(cbody)) {
-    const msg = String(cbody.msg || "");
-    if (cbody.code === 10001 || msg.includes("已签")) return true;
+// 判断领取接口的返回是否表示「今日已签过」。
+// 对空 body 返回 true 是刻意保留的契约（接口用空响应表示幂等成功），
+// 因此调用方必须先把 401/403 判掉——否则登录失效会被误报成已签到。
+function isAlreadyCheckedIn(body) {
+  if (body === null || body === undefined) return true;
+  if (typeof body === "object" && !Array.isArray(body)) {
+    const msg = String(body.msg || "");
+    if (body.code === 10001 || msg.includes("已签")) return true;
   }
   return false;
 }
@@ -483,195 +506,245 @@ function alreadyReport(status, via = null) {
 
 /* ---------- 成长中心（对应 Python 的 run_growth） ---------- */
 
-async function runGrowth(headers, endpoint) {
-  const base = endpoint + "/v2/activity/growth";
-  const parts = [];
-  let creditsGained = 0;
-  // 请求成功率统计：shadow 全局 get/post，自动计数。
-  // 全部请求失败时返回 ERROR，避免上游宕机被静默判为"成长中心无可领取项"。
-  // 注意：全局引用必须在函数外保存（_globalGet/_globalPost），
-  // 不能在本函数内写 const _g = get —— const get 的 TDZ 会让 get 指向未初始化的局部变量。
-  let reqTotal = 0, reqFailed = 0;
-  const get = async (url, h) => { reqTotal++; const r = await _globalGet(url, h); if (r.status < 200 || r.status >= 300) reqFailed++; return r; };
-  const post = async (url, h, body) => { reqTotal++; const r = await _globalPost(url, h, body); if (r.status < 200 || r.status >= 300) reqFailed++; return r; };
+// 成长中心的 5 个阶段互相独立，拆成 step 函数共用一个 ctx：
+//   ctx.base / ctx.headers  请求目标
+//   ctx.stats               请求成败统计（由 request 层自动累计，用于区分「上游全挂」与「登录态失效」）
+//   ctx.parts               报告片段
+//   ctx.credits             本次累计积分
+//   ctx.energy/streakDays   能量与连签天数（stepEnergyStreak 写入，stepRedeem 读取）
+// 抽奖 / 盲盒两段都是「循环 POST、遇错即停、收集结果」，抽成 repeatPost 复用。
 
-  // --- 1. Buddy 旅行：领礼物 + 派出发 ---
-  const s = await get(base + "/buddy/travel/status", headers);
-  let travel = s.status >= 200 && s.status < 300 ? dig(s.body, "state") : null;
-
-  if (s.status === 401 || s.status === 403) {
-    return { code: 1, out: { result: "NO_SESSION", report: "登录态已失效，请重新登录 WorkBuddy 桌面端" } };
+// 依次执行 POST 直到 fn 返回 null（失败）或跑满 n 次
+async function repeatPost(n, fn) {
+  const out = [];
+  for (let i = 0; i < n; i++) {
+    const v = await fn(i);
+    if (v === null) break;
+    out.push(v);
   }
+  return out;
+}
+
+// --- 1. Buddy 旅行：领礼物 + 派出发 ---
+async function stepTravel(ctx) {
+  const { base, headers, parts } = ctx;
+  const travelStatus = await ctx.get(base + "/buddy/travel/status", headers);
+  let travel = is2xx(travelStatus.status) ? dig(travelStatus.body, "state") : null;
+
   if (travel === "arrived") {
-    const recordId = dig(s.body, "record_id");
-    const c = await post(base + "/buddy/travel/claim", headers, { record_id: recordId });
-    if (c.status >= 200 && c.status < 300 && dig(c.body, "reward_credit") !== null) {
-      const got = dig(c.body, "reward_credit");
-      creditsGained += Number(got) || 0;
+    const recordId = dig(travelStatus.body, "record_id");
+    const claimResp = await ctx.post(base + "/buddy/travel/claim", headers, { record_id: recordId });
+    const got = dig(claimResp.body, "reward_credit");
+    if (is2xx(claimResp.status) && got !== null) {
+      ctx.credits += Number(got) || 0;
       parts.push("领旅行礼物 +" + fmtCredit(got) + " 积分");
       travel = "idle"; // 仅在领取成功后变 idle，随后才会派新行程
     } else {
       // 领取失败时不要把状态当成 idle——否则会立刻派新行程，
       // 等于白白丢掉这次已到站的礼物；保持 arrived，下次运行重试领取。
-      parts.push("领旅行礼物失败（HTTP " + c.status + "），本次不派新行程");
+      parts.push("领旅行礼物失败（HTTP " + claimResp.status + "），本次不派新行程");
     }
   }
+
   if (travel === "idle") {
     // 今日出行次数已达上限时不尝试出发，避免白打请求拿到 "daily limit reached"
-    if (dig(s.body, "daily_limit_reached")) {
+    if (dig(travelStatus.body, "daily_limit_reached")) {
       parts.push("Buddy 今日旅行次数已用尽");
     } else {
-      const c = await get(base + "/buddy/travel/config", headers);
-      const locs = c.status >= 200 && c.status < 300 ? dig(c.body, "locations") : null;
+      const configResp = await ctx.get(base + "/buddy/travel/config", headers);
+      const locs = is2xx(configResp.status) ? dig(configResp.body, "locations") : null;
       if (locs && locs.length) {
-        const loc = locs[0];
-        const d = await post(base + "/buddy/travel/depart", headers, { location_id: loc.id });
-        if (d.status >= 200 && d.status < 300) {
-          const locName = (dig(d.body, "location") || {}).name || "?";
-          const dur = dig(d.body, "duration_hours") || (dig(d.body, "location") || {}).duration_hours || "?";
-          parts.push("派 Buddy 去" + locName + "（" + dur + " 小时后回）");
+        const departResp = await ctx.post(base + "/buddy/travel/depart", headers, { location_id: locs[0].id });
+        if (is2xx(departResp.status)) {
+          const loc = dig(departResp.body, "location") || {};
+          const dur = dig(departResp.body, "duration_hours") || loc.duration_hours || "?";
+          parts.push("派 Buddy 去" + (loc.name || "?") + "（" + dur + " 小时后回）");
         } else {
-          const msg = dig(d.body, "msg") || "";
-          parts.push("派 Buddy 失败：" + (msg || "HTTP " + d.status));
+          parts.push("派 Buddy 失败：" + (dig(departResp.body, "msg") || "HTTP " + departResp.status));
         }
       }
     }
   } else if (travel === "traveling") {
-    const locName = (dig(s.body, "location") || {}).name || "?";
-    parts.push("Buddy 旅行中（" + locName + "）");
+    parts.push("Buddy 旅行中（" + ((dig(travelStatus.body, "location") || {}).name || "?") + "）");
   }
+}
 
-  // --- 2. 抽奖（lottery）：余额有多少次就抽多少次，上限 10 次防御异常余额 ---
-  const l = await get(base + "/lottery/chances", headers);
-  const chances = l.status >= 200 && l.status < 300 ? (dig(l.body, "balance") || 0) : 0;
-  if (chances > 0) {
-    const prizes = [];
-    for (let i = 0; i < Math.min(chances, 10); i++) {
-      const clientToken = "draw-" + Math.random().toString(36).slice(2, 10);
-      const d = await post(base + "/lottery/draw", headers, { client_token: clientToken });
-      if (d.status >= 200 && d.status < 300) {
-        const dd = (d.body && d.body.data) || {};
-        prizes.push(dig(dd, "prize_name") || dig(dd, "name") || "未知");
-        // 抽奖可能产积分（credit_amount / credit / reward_credit），累加到合计
-        const lc = Number(dig(dd, "credit_amount") || dig(dd, "credit") || dig(dd, "reward_credit")) || 0;
-        if (lc) creditsGained += lc;
-      } else {
-        parts.push("抽奖失败（HTTP " + d.status + "）");
-        break;
-      }
+// --- 2. 抽奖（lottery）：余额有多少次就抽多少次，上限 10 次防御异常余额 ---
+async function stepLottery(ctx) {
+  const { base, headers, parts } = ctx;
+  const chancesResp = await ctx.get(base + "/lottery/chances", headers);
+  const chances = is2xx(chancesResp.status) ? (dig(chancesResp.body, "balance") || 0) : 0;
+  if (chances <= 0) return;
+
+  const prizes = await repeatPost(Math.min(chances, 10), async () => {
+    const drawResp = await ctx.post(base + "/lottery/draw", headers, { client_token: clientToken("draw") });
+    if (!is2xx(drawResp.status)) {
+      parts.push("抽奖失败（HTTP " + drawResp.status + "）");
+      return null;
     }
-    if (prizes.length) parts.push("抽奖获得：" + prizes.join("、"));
+    // 抽奖可能产积分（credit_amount / credit / reward_credit），累加到合计
+    const credit = Number(dig(drawResp.body, "credit_amount") || dig(drawResp.body, "credit") || dig(drawResp.body, "reward_credit")) || 0;
+    if (credit) ctx.credits += credit;
+    return dig(drawResp.body, "prize_name") || dig(drawResp.body, "name") || "未知";
+  });
+  if (prizes.length) parts.push("抽奖获得：" + prizes.join("、"));
+}
+
+// --- 2.5 真正的盲盒（buddy/open）：消耗能量开 Buddy 物品，每次 10 能量，最多 5 次 ---
+// 与上面的 lottery 抽奖是两个独立功能：lottery 用抽奖次数，blindbox 用能量。
+async function stepBlindbox(ctx) {
+  const { base, headers, parts } = ctx;
+  const quotaResp = await ctx.get(base + "/buddy/quota", headers);
+  const affordable = Number(is2xx(quotaResp.status) ? dig(quotaResp.body, "affordable") : 0) || 0;
+  if (affordable <= 0) return;
+
+  const items = await repeatPost(Math.min(affordable, 5), async () => {
+    const openResp = await ctx.post(base + "/buddy/open", headers, { count: 1 });
+    if (!is2xx(openResp.status) || dig(openResp.body, "code") !== 0) return null;
+
+    const results = dig(openResp.body, "results") || [];
+    if (!results.length) return null;
+    const item = results[0];
+    const instance = item.instance || {};
+    const template = item.template || {};
+    // 盲盒可能产积分，data 层与 item 各层都试一遍
+    const credit = Number(dig(openResp.body, "credit_amount") || dig(openResp.body, "credit_granted") || dig(openResp.body, "reward_credit")
+      || dig(item, "credit") || dig(instance, "credit") || dig(template, "credit")) || 0;
+    if (credit) ctx.credits += credit;
+    return (instance.name || template.name || "?") + "(" + (instance.rarity || template.rarity || "?") + ")";
+  });
+  if (items.length) parts.push("开盲盒获得：" + items.join("、"));
+}
+
+// --- 3. 任务领奖 ---
+async function stepTasks(ctx) {
+  const { base, headers, parts } = ctx;
+  const tasksResp = await ctx.get(base + "/tasks", headers);
+  if (!is2xx(tasksResp.status)) return;
+
+  for (const task of dig(tasksResp.body, "tasks") || []) {
+    const prog = task.progress || {};
+    const done = (prog.current || 0) >= (prog.target || 1);
+    if (!done || task.accept_status === "claimed" || !task.has_reward) continue;
+
+    const acceptResp = await ctx.post(base + "/tasks/accept", headers, { task_code: task.task_code });
+    if (!is2xx(acceptResp.status)) continue;
+    // 用 Number() 归一：接口若把 reward_credit 返回成字符串，
+    // "0 + '100'" 会变成字符串拼接 "0100"，把累计积分整个带偏
+    const credit = Number(task.reward_credit) || 0;
+    const energy = Number(task.reward_energy) || 0;
+    ctx.credits += credit;
+    parts.push("领任务奖「" + (task.title || task.task_code) + "」+credit" + credit + "+energy" + energy);
   }
+}
 
-  // --- 2.5 真正的盲盒（buddy/open）：消耗能量开 Buddy 物品，每次 10 能量，最多 5 次 ---
-  // 与上面的 lottery 抽奖是两个独立功能：lottery 用抽奖次数，blindbox 用能量。
-  const q = await get(base + "/buddy/quota", headers);
-  const qd = q.status >= 200 && q.status < 300 ? (q.body && q.body.data) || {} : {};
-  const affordable = Number(qd.affordable) || 0;
-  if (affordable > 0) {
-    const blindboxItems = [];
-    for (let i = 0; i < Math.min(affordable, 5); i++) {
-      const d = await post(base + "/buddy/open", headers, { count: 1 });
-      if (d.status >= 200 && d.status < 300 && dig(d.body, "code") === 0) {
-        const dd = (d.body && d.body.data) || {};
-        const results = dig(dd, "results") || [];
-        if (results.length) {
-          const it = results[0];
-          const ins = it.instance || {};
-          const tpl = it.template || {};
-          blindboxItems.push((ins.name || tpl.name || "?") + "(" + (ins.rarity || tpl.rarity || "?") + ")");
-          // 盲盒可能产积分，尝试从 data 层或 results[0] 层取
-          const bc = Number(dig(dd, "credit_amount") || dig(dd, "credit_granted") || dig(dd, "reward_credit")
-            || dig(it, "credit") || dig(ins, "credit") || dig(tpl, "credit")) || 0;
-          if (bc) creditsGained += bc;
-        }
-      } else {
-        break;
-      }
-    }
-    if (blindboxItems.length) parts.push("开盲盒获得：" + blindboxItems.join("、"));
-  }
-
-  // --- 3. 任务领奖 ---
-  const t = await get(base + "/tasks", headers);
-  if (t.status >= 200 && t.status < 300) {
-    const tasks = dig(t.body, "tasks") || [];
-    for (const task of tasks) {
-      const prog = task.progress || {};
-      const done = (prog.current || 0) >= (prog.target || 1);
-      if (done && task.accept_status !== "claimed" && task.has_reward) {
-        const a = await post(base + "/tasks/accept", headers, { task_code: task.task_code });
-        if (a.status >= 200 && a.status < 300) {
-          // 用 Number() 归一：接口若把 reward_credit 返回成字符串，
-          // "0 + '100'" 会变成字符串拼接 "0100"，把累计积分整个带偏
-          const rc = Number(task.reward_credit) || 0;
-          const re = Number(task.reward_energy) || 0;
-          creditsGained += rc;
-          parts.push("领任务奖「" + (task.title || task.task_code) + "」+credit" + rc + "+energy" + re);
-        }
-      }
-    }
-  }
-
-  // --- 4. 能量 & 连签状态 ---
-  const e = await get(base + "/energy", headers);
-  const energy = e.status >= 200 && e.status < 300 ? dig(e.body, "balance") : null;
-
-  const s2 = await get(base + "/streak", headers);
+// --- 4. 能量 & 连签状态 ---
+async function stepEnergyStreak(ctx) {
+  const { base, headers } = ctx;
+  const [energyResp, streakResp] = await Promise.all([
+    ctx.get(base + "/energy", headers),
+    ctx.get(base + "/streak", headers),
+  ]);
+  ctx.energy = is2xx(energyResp.status) ? dig(energyResp.body, "balance") : null;
   // dig 找不到时返回 null；?? null 归一，避免 days 为 undefined 时输出「连签 undefined 天」
-  const streakObj = dig(s2.body, "streak") || {};
-  const streakDays = streakObj && typeof streakObj === "object" ? (streakObj.days ?? null) : null;
+  const streak = dig(streakResp.body, "streak") || {};
+  ctx.streakDays = streak && typeof streak === "object" ? (streak.days ?? null) : null;
+}
 
-  // --- 4.5 连签兑换（redeem）：按 7d/14d/28d 档位兑换积分/能量/抽奖次数 ---
-  // 接口天然幂等：已兑换返回 code 409，天数不足返回 403，都静默跳过。
-  if (streakDays !== null && streakDays >= 7) {
-    const tiers = [
-      { tier: "7d", need: 7, label: "入门" },
-      { tier: "14d", need: 14, label: "进阶" },
-      { tier: "28d", need: 28, label: "巅峰" },
-    ];
-    for (const t of tiers) {
-      if (streakDays < t.need) continue;
-      const clientToken = "redeem-" + t.tier + "-" + Math.random().toString(36).slice(2, 10);
-      const resp = await post(base + "/redeem", headers, { tier: t.tier, client_token: clientToken });
-      const code = dig(resp.body, "code");
-      if (code === 0) {
-        const d = (resp.body && resp.body.data) || {};
-        const got = [];
-        const cg = Number(d.credit_granted) || 0;
-        const eg = Number(d.energy_granted) || 0;
-        const chg = Number(d.chances_granted) || 0;
-        if (cg) { creditsGained += cg; got.push("+" + cg + "积分"); }
-        if (eg) got.push("+" + eg + "能量");
-        if (chg) got.push("+" + chg + "抽奖");
-        parts.push("连签兑换" + t.label + "档（" + got.join(" ") + "）");
-      }
-      // code 409 = 已兑换过，403 = 天数不足，都静默不刷屏
-    }
+// --- 4.5 连签兑换（redeem）：按 7d/14d/28d 档位兑换积分/能量/抽奖次数 ---
+// 接口天然幂等：已兑换返回 code 409，天数不足返回 403，都静默跳过。
+const STREAK_TIERS = [
+  { tier: "7d", need: 7, label: "入门" },
+  { tier: "14d", need: 14, label: "进阶" },
+  { tier: "28d", need: 28, label: "巅峰" },
+];
+
+async function stepRedeem(ctx) {
+  const { base, headers, parts, streakDays } = ctx;
+  if (streakDays === null || streakDays < 7) return;
+
+  for (const tier of STREAK_TIERS) {
+    if (streakDays < tier.need) continue;
+    const redeemResp = await ctx.post(base + "/redeem", headers, { tier: tier.tier, client_token: clientToken("redeem-" + tier.tier) });
+    if (dig(redeemResp.body, "code") !== 0) continue; // 409=已兑换过，403=天数不足，静默不刷屏
+
+    const got = [];
+    const credit = Number(dig(redeemResp.body, "credit_granted")) || 0;
+    const energy = Number(dig(redeemResp.body, "energy_granted")) || 0;
+    const chances = Number(dig(redeemResp.body, "chances_granted")) || 0;
+    if (credit) { ctx.credits += credit; got.push("+" + credit + "积分"); }
+    if (energy) got.push("+" + energy + "能量");
+    if (chances) got.push("+" + chances + "抽奖");
+    parts.push("连签兑换" + tier.label + "档（" + got.join(" ") + "）");
   }
+}
+
+async function runGrowth(headers, endpoint) {
+  const stats = { total: 0, failed: 0, auth: 0 };
+  const ctx = {
+    base: endpoint + "/v2/activity/growth",
+    headers: headers,
+    stats: stats,
+    parts: [],
+    credits: 0,
+    energy: null,
+    streakDays: null,
+    // 计数交给 request 层的 stats 参数，不再 shadow 同名 get/post
+    get: (url, h) => request(url, h, "GET", null, stats),
+    post: (url, h, body) => request(url, h, "POST", body, stats),
+  };
+
+  // --- 1. Buddy 旅行：有内部依赖且会改状态，必须先跑 ---
+  await stepTravel(ctx);
+  // 首个请求就 401/403：登录态已失效，不做后续无用功
+  if (stats.auth > 0) {
+    return { code: 1, out: { result: "NO_SESSION", report: "登录态已失效，请重新登录 WorkBuddy 桌面端" } };
+  }
+
+  // --- 2~4 抽奖 / 盲盒 / 任务 / 能量连签：四段互不依赖，并发执行省掉串行 RTT ---
+  await Promise.all([stepLottery(ctx), stepBlindbox(ctx), stepTasks(ctx), stepEnergyStreak(ctx)]);
+  // 兑换依赖 stepEnergyStreak 写入的 streakDays，放在并发之后
+  await stepRedeem(ctx);
 
   // 全部请求失败（上游宕机/网络异常）时返回 ERROR，不与"今天没东西可领"混淆
-  if (reqTotal > 0 && reqFailed === reqTotal) {
-    return { code: 1, out: { result: "ERROR", report: "成长中心全部请求失败（" + reqFailed + "/" + reqTotal + "），上游服务可能异常" } };
+  if (stats.failed === stats.total) {
+    return { code: 1, out: { result: "ERROR", report: "成长中心全部请求失败（" + stats.failed + "/" + stats.total + "），上游服务可能异常" } };
+  }
+  // 首个请求之后的鉴权失败：此前只检查 travel/status 会把失效登录态
+  // 误报成「成长中心无可领取项」，这里补一次判定
+  if (stats.auth > 0 && stats.auth === stats.failed) {
+    return { code: 1, out: { result: "NO_SESSION", report: "成长中心登录态已失效，请重新登录 WorkBuddy 桌面端" } };
   }
 
+  const { parts, credits, energy, streakDays } = ctx;
   const tail = [];
   if (energy !== null) tail.push("能量 " + energy);
   if (streakDays !== null) tail.push("连签 " + streakDays + " 天");
-  if (creditsGained) tail.push("本次 +共 " + creditsGained + " 积分");
+  if (credits) tail.push("本次 +共 " + credits + " 积分");
 
   let report = parts.length ? parts.join("；") : "成长中心无可领取项";
   if (tail.length) report += "（" + tail.join("，") + "）";
   return {
     code: 0,
-    out: { result: "GROWTH", report: report, credits_gained: creditsGained, energy: energy, streak_days: streakDays },
+    out: { result: "GROWTH", report: report, credits_gained: credits, energy: energy, streak_days: streakDays },
   };
 }
 
 /* ---------- 签到主逻辑（对应 Python 的 run_auto） ---------- */
 
+const CHECKIN_STATUS_PATH = "/v2/billing/meter/checkin-activity-status";
+const CHECKIN_CLAIM_PATH = "/v2/billing/meter/daily-checkin";
+
+// 领取接口只返回 credit，streak_days / total_credits 等只能在状态接口拿，
+// 所以领取后要重新拉一次状态；拉取失败时退回领取前那份 status。
+async function refetchStatus(endpoint, headers, fallback) {
+  const resp = await post(endpoint + CHECKIN_STATUS_PATH, headers);
+  const body = is2xx(resp.status) && resp.body && typeof resp.body === "object" ? resp.body : fallback;
+  return body;
+}
+
 async function runAuto(headers, endpoint) {
-  const s = await post(endpoint + "/v2/billing/meter/checkin-activity-status", headers);
+  const s = await post(endpoint + CHECKIN_STATUS_PATH, headers);
 
   if (s.status === 401 || s.status === 403) {
     return {
@@ -679,7 +752,7 @@ async function runAuto(headers, endpoint) {
       out: { result: "NO_SESSION", report: "登录态已失效（HTTP " + s.status + "），请重新登录 WorkBuddy 桌面端", http: s.status },
     };
   }
-  if (!(s.status >= 200 && s.status < 300)) {
+  if (!is2xx(s.status)) {
     return {
       code: 1,
       out: {
@@ -704,14 +777,10 @@ async function runAuto(headers, endpoint) {
     return { code: 0, out: alreadyReport(status) };
   }
 
-  const c = await post(endpoint + "/v2/billing/meter/daily-checkin", headers);
+  const c = await post(endpoint + CHECKIN_CLAIM_PATH, headers);
 
-  if (isAlreadyCheckedIn(c.body)) {
-    const s2 = await post(endpoint + "/v2/billing/meter/checkin-activity-status", headers);
-    const fresh = s2.status >= 200 && s2.status < 300 && s2.body && typeof s2.body === "object" ? s2.body : status;
-    return { code: 0, out: alreadyReport(fresh, "今日已签过（服务端判定已领取）") };
-  }
-
+  // 鉴权失败必须排在 isAlreadyCheckedIn 之前：后者对空 body 返回 true，
+  // 若先判它，登录失效（返回 null body）会被误报成「今日已签过」并给出 code 0。
   if (c.status === 401 || c.status === 403) {
     return {
       code: 1,
@@ -719,10 +788,14 @@ async function runAuto(headers, endpoint) {
     };
   }
 
+  if (isAlreadyCheckedIn(c.body)) {
+    const fresh = await refetchStatus(endpoint, headers, status);
+    return { code: 0, out: alreadyReport(fresh, "今日已签过（服务端判定已领取）") };
+  }
+
   const credit = dig(c.body, "credit");
   if (credit !== null) {
-    const s2 = await post(endpoint + "/v2/billing/meter/checkin-activity-status", headers);
-    const fresh = s2.status >= 200 && s2.status < 300 && s2.body && typeof s2.body === "object" ? s2.body : status;
+    const fresh = await refetchStatus(endpoint, headers, status);
     // 用 ?? 而非 ||：streak_days 为 0 时不应回退；字段整体缺失时为 null
     const streakDays = dig(fresh, "streak_days") ?? dig(status, "streak_days");
     const totalCredits = dig(fresh, "total_credits");
@@ -768,6 +841,12 @@ async function runAuto(headers, endpoint) {
 }
 
 /* ---------- 动作调度：单账号执行 + 多账号聚合 ---------- */
+
+// 调试动作（status / claim）对应的接口路径
+const DEBUG_STEP_PATHS = {
+  status: CHECKIN_STATUS_PATH,
+  claim: CHECKIN_CLAIM_PATH,
+};
 
 // trigger：执行来源标记，写入日志便于区分（"cron" = 定时触发 / "http:<action>" = 手动访问）
 async function runOne(account, action, trigger, env) {
@@ -828,17 +907,14 @@ async function runOne(account, action, trigger, env) {
       case "growth":
         r = await runGrowth(headers, endpoint);
         break;
-      case "status": {
-        const s = await post(endpoint + "/v2/billing/meter/checkin-activity-status", headers);
-        const authFail = s.status === 401 || s.status === 403;
-        // 401/403 时 code 设为 1 并标 NO_SESSION，否则 httpStatusFor 恒返回 200，监控测不到登录失效
-        r = { code: authFail ? 1 : 0, out: { step: "status", http: s.status, body: s.body, result: authFail ? "NO_SESSION" : undefined } };
-        break;
-      }
+      // status / claim 是调试动作，只把接口原始返回透出去，不做业务解析。
+      // 两者结构完全对称，用同一段代码处理。
+      case "status":
       case "claim": {
-        const c = await post(endpoint + "/v2/billing/meter/daily-checkin", headers);
-        const authFail = c.status === 401 || c.status === 403;
-        r = { code: authFail ? 1 : 0, out: { step: "claim", http: c.status, body: c.body, result: authFail ? "NO_SESSION" : undefined } };
+        const resp = await post(endpoint + DEBUG_STEP_PATHS[action], headers);
+        const authFail = resp.status === 401 || resp.status === 403;
+        // 401/403 时 code 设为 1 并标 NO_SESSION，否则 httpStatusFor 恒返回 200，监控测不到登录失效
+        r = { code: authFail ? 1 : 0, out: { step: action, http: resp.status, body: resp.body, result: authFail ? "NO_SESSION" : undefined } };
         break;
       }
       default:
@@ -878,14 +954,14 @@ function effectiveResult(o) {
 
 function aggregateResult(outs) {
   const results = outs.map(effectiveResult);
+  // 全体一致时直接返回该值（涵盖「全成功且同为 CLAIMED」与「全失败且同为同一错误」两种情况）
+  if (results.every((x) => x === results[0])) return results[0];
+  // 结果不一致：全为坏结果才算整体失败，否则是部分失败
   const bad = results.filter((x) => !GOOD_RESULTS.has(x));
-  if (!bad.length) {
-    if (results.every((x) => x === results[0])) return results[0];
-    if (results.includes("CLAIMED")) return "CLAIMED"; // 有账号领到积分即算领取成功
-    return "OK";
-  }
-  if (bad.length === results.length && results.every((x) => x === results[0])) return results[0];
-  return bad.length === results.length ? "FAILED" : "PARTIAL_FAILED";
+  if (bad.length === results.length) return "FAILED";
+  if (bad.length) return "PARTIAL_FAILED";
+  if (results.includes("CLAIMED")) return "CLAIMED"; // 有账号领到积分即算领取成功
+  return "OK";
 }
 
 // 多账号依次执行并聚合；单账号输出保持平铺（与旧版 JSON 形态兼容）
@@ -899,7 +975,21 @@ async function runAction(env, action, trigger, filterName) {
 
   const results = [];
   for (const acc of accounts) {
-    results.push(await runOne(acc, action, trigger, env));
+    // 单个账号抛错不能让整批中断：否则后面账号全都不执行，
+    // 且已成功账号的结果会随异常一起丢失（日志里看不到已领取的记录）。
+    try {
+      results.push(await runOne(acc, action, trigger, env));
+    } catch (e) {
+      results.push({
+        code: 1,
+        out: {
+          account: acc.name,
+          trigger: trigger,
+          result: "ERROR",
+          report: "账号执行异常：" + String((e && e.message) || e),
+        },
+      });
+    }
   }
 
   if (results.length === 1) return results[0];
@@ -934,12 +1024,7 @@ const CRON_KEY = "signin:cron:last";
 // 防止 cron 与手动 /auto 同时触发时，对同一账号并行请求上游。
 const LOCK_PREFIX = "signin:lock:";
 const LOCK_TTL = 90; // 秒
-// Refresh Token 续期状态：按 uid 分 key，存最新 AT/RT 与上次刷新时间。
-// 与环境变量里的初始凭据配合——谁的 AT 更新（exp 更晚）就用谁的，刷新结果统一落 KV。
-const RT_STORE_PREFIX = "signin:rt:";
-const REFRESH_URL = "https://copilot.tencent.com/v2/plugin/auth/token/refresh";
-const REFRESH_INTERVAL_SEC = 10 * 86400; // 距上次刷新超过 10 天则续期
-const REFRESH_BEFORE_EXPIRE_SEC = 7 * 86400; // AT 剩余不足 7 天则续期
+// Refresh Token 续期状态的读写（key 前缀 RT_STORE_PREFIX 见文件前部）
 
 async function loadRtState(env, uid) {
   if (!env.KV || !uid) return null;
@@ -953,7 +1038,11 @@ async function saveRtState(env, uid, state) {
   if (!env.KV || !uid) return;
   try {
     await env.KV.put(RT_STORE_PREFIX + uid, JSON.stringify(state));
-  } catch (e) { /* KV 写入失败不阻塞主流程 */ }
+  } catch (e) {
+    // 写入失败不阻塞主流程，但要留痕：否则「续期成功却没落盘」会表现为
+    // 下次运行又拿旧 AT 反复续期，且表面上看不出任何异常。
+    console.warn("[workbuddy-signin] 续期状态写入 KV 失败：" + (e && e.message));
+  }
 }
 
 // 列出全部日志 key，按时间倒序（新 → 旧）
@@ -1024,8 +1113,10 @@ async function loadHistory(env) {
 
 /* ---------- JSON / HTML 响应 ---------- */
 
-function jsonResponse(obj, status = 200) {
-  return new Response(JSON.stringify(obj, null, 2), {
+// indent 传 null 时输出紧凑 JSON：/logs 一次返回 30 条完整记录，
+// pretty-print 会让体积膨胀数倍，程序化调用时是纯浪费
+function jsonResponse(obj, status = 200, indent = 2) {
+  return new Response(JSON.stringify(obj, null, indent), {
     status: status,
     // 这些接口返回的都是实时状态，缓存住会让人误判（如刷新页面看不到最新 version / 日志）
     headers: { "Content-Type": "application/json; charset=utf-8", "Cache-Control": "no-store" },
@@ -1039,10 +1130,11 @@ function htmlResponse(html, status = 200) {
   });
 }
 
+// HTML 实体映射提到模块级：日志页一次渲染几百次，原先每次调用都新建对象
+const HTML_ESCAPES = { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" };
+
 function escapeHtml(v) {
-  return String(v == null ? "" : v).replace(/[&<>"']/g, (c) => ({
-    "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;",
-  }[c]));
+  return String(v == null ? "" : v).replace(/[&<>"']/g, (c) => HTML_ESCAPES[c]);
 }
 
 function truncate(s, n) {
@@ -1050,12 +1142,13 @@ function truncate(s, n) {
   return s.length > n ? s.slice(0, n) + "…" : s;
 }
 
+const pad2 = (n) => String(n).padStart(2, "0");
+
 // 北京时间（UTC+8）格式化，形如 2026-09-12 14:58:30
 function fmtCN(ms) {
   const d = new Date(Number(ms) + 8 * 3600 * 1000);
-  const p = (n) => String(n).padStart(2, "0");
-  return d.getUTCFullYear() + "-" + p(d.getUTCMonth() + 1) + "-" + p(d.getUTCDate()) +
-    " " + p(d.getUTCHours()) + ":" + p(d.getUTCMinutes()) + ":" + p(d.getUTCSeconds());
+  return d.getUTCFullYear() + "-" + pad2(d.getUTCMonth() + 1) + "-" + pad2(d.getUTCDate()) +
+    " " + pad2(d.getUTCHours()) + ":" + pad2(d.getUTCMinutes()) + ":" + pad2(d.getUTCSeconds());
 }
 
 function triggerLabel(t) {
@@ -1324,7 +1417,7 @@ async function renderHome(env, keyPart) {
       if (a.error) return escapeHtml(displayName(a.name)) + '：<span style="color:#B03A3C;">配置无效（' + escapeHtml(a.error) + "）</span>";
       let t = "";
       if (a.tokenInfo) {
-        const expireDate = new Date(a.tokenInfo.expireAt).toISOString().slice(0, 10);
+        const expireDate = expireDateOf(a.tokenInfo);
         t = a.tokenInfo.expired
           ? '，<span style="color:#B03A3C;">令牌已过期（' + expireDate + "）</span>"
           : "，令牌剩 " + a.tokenInfo.daysLeft + " 天（" + expireDate + " 到期）";
@@ -1366,12 +1459,17 @@ function wantsHtml(request) {
 }
 
 // 失败结果的 HTTP 状态码：让调用方/监控能区分「客户端配置错」与「服务端异常」，
-// 而不是所有失败一律 500。未列出的结果保持 500。
+// 而不是所有失败一律 500。未列出的结果按 code 兜底。
 const HTTP_STATUS_BY_RESULT = {
   CONFIG_ERROR: 400,
   BAD_ACCOUNT: 400,
   NO_SESSION: 401,
   TOKEN_EXPIRED: 401,
+  // 聚合类失败必须显式映射：多账号下某个账号被 applyTokenWarning 改写 result 时
+  // code 仍是 0（该账号自身调用是成功的），若不在此声明就会落到 code===0 → 200，
+  // 让「部分失败」在监控里显示为成功。
+  PARTIAL_FAILED: 500,
+  FAILED: 500,
 };
 
 function httpStatusFor(out, code) {
@@ -1501,7 +1599,8 @@ export default {
         return jsonResponse({ result: "DETAIL", index: idx, entry: history[idx] || null });
       }
       if (asHtml) return htmlResponse(renderLogList(history, keyPart));
-      return jsonResponse({ result: "LOG", count: history.length, history: history });
+      // 日志列表体积大（30 条完整记录），走紧凑 JSON
+      return jsonResponse({ result: "LOG", count: history.length, history: history }, 200, null);
     }
 
     const action = route.action;
