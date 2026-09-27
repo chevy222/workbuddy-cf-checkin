@@ -60,7 +60,7 @@
 // 日期（yyyymmdd）+ 当天第几次改动。当天第几个改动就写几；
 // 跨天则换成当天日期、序号从 1 重新开始。页脚会显示它——配合自动部署时，
 // 刷新页面看这一行变没变，就知道新版本上线没有。
-const BUILD_VERSION = "20260927:4";
+const BUILD_VERSION = "20260927:5";
 
 const DEFAULT_ENDPOINT = "https://copilot.tencent.com";
 
@@ -373,31 +373,37 @@ function resolveAccounts(env, filterName) {
       }
     });
   } else {
-    // 方式三：向后兼容——单账号环境变量
-    let session = null;
+    // 方式三：向后兼容——单账号环境变量。
+    // 统一收敛成一份 conf 再交给 buildAccount，避免与「token+uid」形态的解析逻辑重复一遍
+    // （enterpriseId / domain / refreshToken 的挂载原先在这里又写了一份）。
+    const conf = { name: "default" };
     if (env.WORKBUDDY_SESSION) {
       try {
-        session = JSON.parse(env.WORKBUDDY_SESSION);
+        conf.session = JSON.parse(env.WORKBUDDY_SESSION);
       } catch (e) {
         throw taggedError("CONFIG_ERROR", "WORKBUDDY_SESSION 不是合法 JSON");
       }
     } else if (env.WORKBUDDY_TOKEN && env.WORKBUDDY_UID) {
-      session = {
-        auth: { accessToken: env.WORKBUDDY_TOKEN },
-        account: { uid: env.WORKBUDDY_UID },
-      };
-      if (env.WORKBUDDY_ENTERPRISE_ID) session.account.enterpriseId = env.WORKBUDDY_ENTERPRISE_ID;
-      if (env.WORKBUDDY_DOMAIN) session.auth.domain = env.WORKBUDDY_DOMAIN;
-      if (env.WORKBUDDY_REFRESH_TOKEN) session.auth.refreshToken = env.WORKBUDDY_REFRESH_TOKEN;
+      conf.token = env.WORKBUDDY_TOKEN;
+      conf.uid = env.WORKBUDDY_UID;
+      conf.enterpriseId = env.WORKBUDDY_ENTERPRISE_ID;
+      conf.domain = env.WORKBUDDY_DOMAIN;
+      conf.refresh_token = env.WORKBUDDY_REFRESH_TOKEN;
     }
-    if (!session) {
+    if (!conf.session && !conf.token) {
       throw taggedError("CONFIG_ERROR",
         "未配置登录凭据。请在 Worker 的 设置 → 变量和机密 中添加 Secret：" +
         "多账号用 WORKBUDDY_ACCOUNTS（JSON 数组）或 WORKBUDDY_ACCOUNT_1、WORKBUDDY_ACCOUNT_2（每号一个）；" +
         "单账号用 WORKBUDDY_SESSION（workbuddy-desktop.info 完整 JSON），或分别添加 WORKBUDDY_TOKEN 与 WORKBUDDY_UID。"
       );
     }
-    accounts.push(buildAccount({ name: "default", session: session }, 0, env));
+    try {
+      accounts.push(buildAccount(conf, 0, env));
+    } catch (e) {
+      // 单账号配置的任何解析失败都归为「配置错误」（HTTP 400），
+      // 不落到 runAction 的 ERROR 兜底（HTTP 500）——那会让人误以为服务端出问题
+      throw taggedError("CONFIG_ERROR", String((e && e.message) || e));
+    }
   }
 
   // 重名自动加序号
