@@ -60,7 +60,7 @@
 // 日期（yyyymmdd）+ 当天第几次改动。当天第几个改动就写几；
 // 跨天则换成当天日期、序号从 1 重新开始。页脚会显示它——配合自动部署时，
 // 刷新页面看这一行变没变，就知道新版本上线没有。
-const BUILD_VERSION = "20260927:8";
+const BUILD_VERSION = "20260927:9";
 
 const DEFAULT_ENDPOINT = "https://copilot.tencent.com";
 
@@ -685,7 +685,11 @@ async function stepTasks(ctx) {
     const credit = Number(task.reward_credit) || 0;
     const energy = Number(task.reward_energy) || 0;
     ctx.credits += credit;
-    parts.push("领任务奖「" + (task.title || task.task_code) + "」+credit" + credit + "+energy" + energy);
+    // 只列出实际拿到的奖励项，与成长中心其它步骤的「+20 积分」文案风格一致
+    const gains = [];
+    if (credit) gains.push("+" + credit + " 积分");
+    if (energy) gains.push("+" + energy + " 能量");
+    parts.push("领任务奖「" + (task.title || task.task_code) + "」" + (gains.length ? " " + gains.join("、") : ""));
   }
 }
 
