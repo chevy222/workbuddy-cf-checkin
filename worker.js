@@ -60,7 +60,7 @@
 // 日期（yyyymmdd）+ 当天第几次改动。当天第几个改动就写几；
 // 跨天则换成当天日期、序号从 1 重新开始。页脚会显示它——配合自动部署时，
 // 刷新页面看这一行变没变，就知道新版本上线没有。
-const BUILD_VERSION = "20260927:6";
+const BUILD_VERSION = "20260927:7";
 
 const DEFAULT_ENDPOINT = "https://copilot.tencent.com";
 
@@ -79,6 +79,9 @@ const REFRESH_BEFORE_EXPIRE_SEC = 7 * 86400; // AT 剩余不足 7 天则续期
 
 // 2xx 判定：原先散落 13 处 `status >= 200 && status < 300`，统一走这里
 const is2xx = (status) => status >= 200 && status < 300;
+
+// 2xx/3xx 判定：调试动作（status / claim）的原始返回按此归一成功与失败，见 effectiveResult
+const isOk = (status) => status >= 200 && status < 400;
 
 // 统一的 fetch + JSON 解析骨架：非 JSON 响应兜底成 {raw}，网络异常/超时兜底成 status -1。
 // rawLimit 控制非 JSON 时的截断长度，timeoutMsg 控制超时的提示文案。
@@ -544,10 +547,11 @@ function alreadyReport(status, via = null) {
 
 // 成长中心的 5 个阶段互相独立，拆成 step 函数共用一个 ctx：
 //   ctx.base / ctx.headers  请求目标
-//   ctx.stats               请求成败统计（由 request 层自动累计，用于区分「上游全挂」与「登录态失效」）
 //   ctx.parts               报告片段
 //   ctx.credits             本次累计积分
 //   ctx.energy/streakDays   能量与连签天数（stepEnergyStreak 写入，stepRedeem 读取）
+// 请求成败统计由 request 层的 stats 参数累计（用于区分「上游全挂」与「登录态失效」），
+// 只存在于 runGrowth 的局部变量里，不进 ctx。
 // 抽奖 / 盲盒两段都是「循环 POST、遇错即停、收集结果」，抽成 repeatPost 复用。
 
 // 依次执行 POST 直到 fn 返回 null（失败）或跑满 n 次
@@ -722,12 +726,11 @@ async function runGrowth(headers, endpoint) {
   const ctx = {
     base: endpoint + "/v2/activity/growth",
     headers: headers,
-    stats: stats,
     parts: [],
     credits: 0,
     energy: null,
     streakDays: null,
-    // 计数交给 request 层的 stats 参数，不再 shadow 同名 get/post
+    // 计数交给 request 层的 stats 参数
     get: (url, h) => request(url, h, "GET", null, stats),
     post: (url, h, body) => request(url, h, "POST", body, stats),
   };
@@ -980,10 +983,7 @@ const GOOD_RESULTS = new Set(["CLAIMED", "ALREADY", "INACTIVE", "GROWTH", "OK", 
 // 2xx/3xx 算 OK，4xx/5xx/网络异常(-1) 算 ERROR，避免顶层 result 变成 undefined
 function effectiveResult(o) {
   if (o.result) return o.result;
-  if (o.step) {
-    const n = Number(o.http);
-    return (n >= 200 && n < 400) ? "OK" : "ERROR";
-  }
+  if (o.step) return isOk(Number(o.http)) ? "OK" : "ERROR";
   return undefined;
 }
 
@@ -1301,9 +1301,12 @@ function toolbar(keyPart) {
     "</div>";
 }
 
-// 单账号兼容配置的内部名 default 不直接展示给用户
+// 单账号兼容配置的内部名 default 只是占位，不算真实账号名
+const isDefaultName = (n) => !n || n === "default";
+
+// 首页展示用：「default」换成对用户友好的文案
 function displayName(n) {
-  return n && n !== "default" ? n : "默认账号";
+  return isDefaultName(n) ? "默认账号" : n;
 }
 
 // RT 自动续期状态徽章：enabled=true 绿色"自动续期"，false 灰色"未配续期"
@@ -1335,9 +1338,9 @@ function accountCard(a) {
   if (a.token_expired) meta.push("令牌已过期（" + a.token_expire_at + "）");
 
   // 单账号（内部名 default）不重复显示账号名
-  const nameHtml = (a.account && a.account !== "default")
-    ? '<span class="accname">' + escapeHtml(a.account) + "</span>"
-    : "";
+  const nameHtml = isDefaultName(a.account)
+    ? ""
+    : '<span class="accname">' + escapeHtml(a.account) + "</span>";
   // RT 自动续期状态标记（rt_enabled 字段由 runOne 附上）
   const rtBadge = (a.rt_enabled != null) ? rtBadgeHtml(!!a.rt_enabled) : "";
   let html = '<div class="card"><div class="cardhd">' +
@@ -1362,15 +1365,14 @@ function renderLogList(history, keyPart) {
       const multi = Array.isArray(e.accounts) && e.accounts.length;
       const lines = multi ? e.accounts : [e];
       lines.forEach((o, j) => {
-        const b = badgeFor(o);
         const note = o.report || debugBrief(o) || "";
         let row = "<tr>";
         if (j === 0) {
           row += '<td data-label="时间(北京)" rowspan="' + lines.length + '" style="white-space:nowrap;color:#6B7280;font-size:12px;">' +
             escapeHtml(e.time) + "<br>" + escapeHtml(triggerLabel(e.trigger)) + "</td>";
         }
-        row += '<td data-label="结果"><span class="badge b-' + b.cls + '">' + escapeHtml(b.label) + "</span></td>";
-        const accLabel = o.account && o.account !== "default" ? o.account : "—";
+        row += '<td data-label="结果">' + badgeHtml(o) + "</td>";
+        const accLabel = isDefaultName(o.account) ? "—" : o.account;
         row += '<td data-label="账号" style="white-space:nowrap;">' + escapeHtml(accLabel) + "</td>";
         row += '<td data-label="说明" style="color:#374151;">' + escapeHtml(truncate(note, 120)) + "</td>";
         if (j === 0) {
@@ -1585,7 +1587,7 @@ export default {
 
     // 未知路径（含 /favicon.ico 与扫描器探测）：一律 404，不执行动作、不写日志
     if (route.kind === "notfound") {
-      if ((request.headers.get("accept") || "").includes("text/html")) {
+      if (wantsHtml(request)) {
         return htmlResponse(pageShell("Not Found",
           '<div class="card">页面不存在。返回 <a href="/">首页</a>，可用路径：/auto、/growth、/status、/claim、/logs。</div>', false), 404);
       }
