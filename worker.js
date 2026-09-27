@@ -60,17 +60,26 @@
 // 日期（yyyymmdd）+ 当天第几次改动。当天第几个改动就写几；
 // 跨天则换成当天日期、序号从 1 重新开始。页脚会显示它——配合自动部署时，
 // 刷新页面看这一行变没变，就知道新版本上线没有。
-const BUILD_VERSION = "20260927:7";
+const BUILD_VERSION = "20260927:8";
 
 const DEFAULT_ENDPOINT = "https://copilot.tencent.com";
+
+/* ---------- KV 键名与 TTL（集中声明：避免常量散落、使用点早于声明点） ---------- */
+
+// Refresh Token 续期状态：按 uid 分 key，存最新 AT/RT 与上次刷新时间。
+// 与环境变量里的初始凭据配合——谁的 AT 更新（exp 更晚）就用谁的，刷新结果统一落 KV。
+const RT_STORE_PREFIX = "signin:rt:";
+const LOG_PREFIX = "signin:log:"; // 每次运行一条独立记录
+const LEGACY_LOG_KEY = "signin:history"; // 旧版单 key 日志，仅在新格式一条都没有时回退读取
+const CRON_KEY = "signin:cron:last"; // Cron 心跳：只由 scheduled() 写
+const LOCK_PREFIX = "signin:lock:"; // 乐观并发锁（按 uid）
+const LOG_KEEP = 30; // 日志保留条数
+const LOCK_TTL = 90; // 并发锁 TTL（秒）
 
 /* ---------- 令牌续期参数 ---------- */
 // 集中放在文件前部：下面的 TOKEN_WARN_DAYS 由 REFRESH_BEFORE_EXPIRE_SEC 推导，
 // 若声明在使用点之后会撞上 const 的暂时性死区，模块加载即报错。
 
-// Refresh Token 续期状态：按 uid 分 key，存最新 AT/RT 与上次刷新时间。
-// 与环境变量里的初始凭据配合——谁的 AT 更新（exp 更晚）就用谁的，刷新结果统一落 KV。
-const RT_STORE_PREFIX = "signin:rt:";
 const REFRESH_URL = "https://copilot.tencent.com/v2/plugin/auth/token/refresh";
 const REFRESH_INTERVAL_SEC = 10 * 86400; // 距上次刷新超过 10 天则续期
 const REFRESH_BEFORE_EXPIRE_SEC = 7 * 86400; // AT 剩余不足 7 天则续期
@@ -967,7 +976,9 @@ async function runOne(account, action, trigger, env) {
     // 附上账号名、执行来源与令牌到期预警
     r.out.account = account.name;
     r.out.trigger = trigger;
-    r.out.rt_enabled = !!account.refreshToken; // 该账号是否配置了 RT 自动续期
+    // RT 自动续期标记：与首页徽章共用 accountRtEnabled，避免「结果里只认环境变量、
+    // 首页还认 KV 记录」造成同一账号两处显示相反
+    r.out.rt_enabled = await accountRtEnabled(account, env);
     r.out = applyTokenWarning(r.out, tokenInfo);
     return r;
   } finally {
@@ -1043,23 +1054,14 @@ async function runAction(env, action, trigger, filterName) {
   };
 }
 
-/* ---------- KV 运行日志 ---------- */
+/* ---------- KV 运行日志（key 前缀与 TTL 见文件前部的常量块） ---------- */
 
-// 每次运行写独立 key（signin:log:<北京时间>-<随机后缀>），而不是往同一个 key
+// 日志按「一次运行一个 key」（signin:log:<北京时间>-<随机后缀>）写入，而不是往同一个 key
 // 里 read-modify-write。原因：KV 是最终一致的，且同一 key 有 1 次写/秒的限制，
 // 定时任务与手动 /auto 撞在一起时，后写会整体覆盖前写，静默丢记录。
 // key 前缀是零填充的 ISO 时间，字典序 = 时间序，排序即可拿到倒序列表。
-const LOG_PREFIX = "signin:log:";
-const LOG_KEEP = 30;
-const LEGACY_LOG_KEY = "signin:history";
-// Cron 心跳：只由 scheduled() 写。用途是证明「定时任务真的被调度到过」，
-// 并把 Cloudflare 实际使用的表达式记下来供核对——不受日志裁剪影响。
-const CRON_KEY = "signin:cron:last";
-// 乐观并发锁（对齐 trae 版的 lock:<uid>）：KV 无 CAS，尽力而为，TTL 自动回收。
-// 防止 cron 与手动 /auto 同时触发时，对同一账号并行请求上游。
-const LOCK_PREFIX = "signin:lock:";
-const LOCK_TTL = 90; // 秒
-// Refresh Token 续期状态的读写（key 前缀 RT_STORE_PREFIX 见文件前部）
+
+// Refresh Token 续期状态的读写
 
 async function loadRtState(env, uid) {
   if (!env.KV || !uid) return null;
