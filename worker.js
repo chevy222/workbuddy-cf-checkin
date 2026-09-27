@@ -60,7 +60,7 @@
 // 日期（yyyymmdd）+ 当天第几次改动。当天第几个改动就写几；
 // 跨天则换成当天日期、序号从 1 重新开始。页脚会显示它——配合自动部署时，
 // 刷新页面看这一行变没变，就知道新版本上线没有。
-const BUILD_VERSION = "20260927:10";
+const BUILD_VERSION = "20260927:11";
 
 const DEFAULT_ENDPOINT = "https://copilot.tencent.com";
 
@@ -80,13 +80,15 @@ const LOCK_TTL = 90; // 并发锁 TTL（秒）
 // 集中放在文件前部：下面的 TOKEN_WARN_DAYS 由 REFRESH_BEFORE_EXPIRE_SEC 推导，
 // 若声明在使用点之后会撞上 const 的暂时性死区，模块加载即报错。
 
+// 续期端点刻意硬编码官方域名：与账号的 endpoint 无关（当前不存在自定义域名场景），
+// 若未来出现自定义 endpoint 的账号需要续期，再改为按 account.endpoint 拼接
 const REFRESH_URL = "https://copilot.tencent.com/v2/plugin/auth/token/refresh";
 const REFRESH_INTERVAL_SEC = 10 * 86400; // 距上次刷新超过 10 天则续期
 const REFRESH_BEFORE_EXPIRE_SEC = 7 * 86400; // AT 剩余不足 7 天则续期
 
 /* ---------- HTTP 基础（对应 Python 的 _request/post/get） ---------- */
 
-// 2xx 判定：原先散落 13 处 `status >= 200 && status < 300`，统一走这里
+// 2xx 判定统一入口
 const is2xx = (status) => status >= 200 && status < 300;
 
 // 2xx/3xx 判定：调试动作（status / claim）的原始返回按此归一成功与失败，见 effectiveResult
@@ -386,8 +388,7 @@ function resolveAccounts(env, filterName) {
     });
   } else {
     // 方式三：向后兼容——单账号环境变量。
-    // 统一收敛成一份 conf 再交给 buildAccount，避免与「token+uid」形态的解析逻辑重复一遍
-    // （enterpriseId / domain / refreshToken 的挂载原先在这里又写了一份）。
+    // 统一收敛成一份 conf 再交给 buildAccount，避免与「token+uid」形态的解析逻辑重复。
     const conf = { name: "default" };
     if (env.WORKBUDDY_SESSION) {
       try {
@@ -493,7 +494,7 @@ const digNum = (obj, key) => Number(dig(obj, key)) || 0;
 
 // 依次探测多组 [对象, 字段名]，取第一个非 0 的数字：
 // 不同接口版本把积分挂在 credit_amount / credit / reward_credit 等不同字段上，只能逐个试。
-// 某项取到 0 / 非数字时继续试下一项（与原 `a || b || c` 的探测语义一致）。
+// 某项取到 0 / 非数字时继续试下一项。
 function firstNum(pairs) {
   for (const [obj, key] of pairs) {
     const n = digNum(obj, key);
@@ -519,8 +520,7 @@ function isAlreadyCheckedIn(body) {
   return false;
 }
 
-// 状态接口的字段抽取：已签（alreadyReport）与刚领取（CLAIMED）两条路径共用，
-// 原先同一批 dig 写了两遍，且两处对 streak_days 的回退策略还不一致。
+// 状态接口的字段抽取：已签（alreadyReport）与刚领取（CLAIMED）两条路径共用。
 // fallback 供「领取后补拉状态」用：补拉成功但缺字段时退回领取前那份，避免显示成空白。
 function pickStatus(status, fallback = null) {
   const pick = (key) => dig(status, key) ?? (fallback ? dig(fallback, key) : null);
@@ -764,8 +764,8 @@ async function runGrowth(headers, endpoint) {
   if (stats.failed === stats.total) {
     return { code: 1, out: { result: "ERROR", report: "成长中心全部请求失败（" + stats.failed + "/" + stats.total + "），上游服务可能异常" } };
   }
-  // 首个请求之后的鉴权失败：此前只检查 travel/status 会把失效登录态
-  // 误报成「成长中心无可领取项」，这里补一次判定
+  // 鉴权失败集中判定：所有成长中心接口的 401/403 都计入 stats.auth，
+  // 失效登录态不能被误报成「成长中心无可领取项」
   if (stats.auth > 0 && stats.auth === stats.failed) {
     return { code: 1, out: { result: "NO_SESSION", report: "成长中心登录态已失效，请重新登录 WorkBuddy 桌面端" } };
   }
@@ -1175,7 +1175,7 @@ function htmlResponse(html, status = 200) {
   });
 }
 
-// HTML 实体映射提到模块级：日志页一次渲染几百次，原先每次调用都新建对象
+// 模块级 HTML 实体映射：日志页一次渲染几百次，避免每次调用都重建对象
 const HTML_ESCAPES = { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" };
 
 function escapeHtml(v) {
