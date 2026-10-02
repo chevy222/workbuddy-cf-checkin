@@ -668,23 +668,62 @@ async function stepBlindbox(ctx) {
 }
 
 // --- 3. 任务领奖 ---
+// 状态机按 accept_status 分流（与成长中心页面的实现一致）：
+//   not_accepted            → 先批量接领（accept 只是"开通"，发奖要等 claim）
+//   accepted / in_progress  → 还没做完，本轮什么都不做
+//   completed               → 已完成待领奖 → claim
+//   claimed                 → 已领，跳过
+//
+// 三道坎都是实测踩出来的，前两道会让这批任务一个都接不上：
+//   ① `tasks/accept` 是**批量**接口，体必须是数组 `{ task_codes: [...] }`。
+//      发单值 `{ task_code }` 会被上游判成非法请求（400 invalid request）。
+//   ② **对已完成的任务发 accept 一律 400** —— 所以 accept 只发给 not_accepted 的，
+//      绝不能按"进度满了就算完成"去挑（那挑出来的全是 completed）。
+//   ③ accept ≠ 发奖：奖励要 `tasks/{code}/claim` 才到账。拿列表里的 `reward_credit`
+//      当"已领到"记账，会报出一笔没真正到手的数字。
+//
+// `wb_wechat_oa_subscribe_task` 不接领：读任务列表前要先刷 `/subscribe-task/status`
+// 才能拿到它的真实状态，本脚本不做那一步，读到的 not_accepted 是过期的，
+// 拿去接领上游会判不通过（它变成 completed 之后照常领奖）。
+const NO_ACCEPT_TASKS = new Set(["wb_wechat_oa_subscribe_task"]);
+
 async function stepTasks(ctx) {
   const { base, headers, parts } = ctx;
   const tasksResp = await ctx.get(base + "/tasks", headers);
   if (!is2xx(tasksResp.status)) return;
 
-  for (const task of dig(tasksResp.body, "tasks") || []) {
-    const prog = task.progress || {};
-    const done = (prog.current || 0) >= (prog.target || 1);
-    if (!done || task.accept_status === "claimed" || !task.has_reward) continue;
+  const tasks = dig(tasksResp.body, "tasks") || [];
+  // 先在内存里按状态分流，避免"边扫边发请求"时把同一个任务算重
+  const withReward = (status) => tasks.filter((t) => t.accept_status === status && t.has_reward);
+  const pending = withReward("not_accepted").filter((t) => !NO_ACCEPT_TASKS.has(t.task_code));
+  const ready = withReward("completed");
 
-    const acceptResp = await ctx.post(base + "/tasks/accept", headers, { task_code: task.task_code });
-    if (!is2xx(acceptResp.status)) continue;
-    // 用 Number() 归一：接口若把 reward_credit 返回成字符串，
-    // "0 + '100'" 会变成字符串拼接 "0100"，把累计积分整个带偏
-    const credit = Number(task.reward_credit) || 0;
-    const energy = Number(task.reward_energy) || 0;
-    ctx.credits += credit;
+  // 1) 批量接领：只发 not_accepted 的，体是数组
+  if (pending.length) {
+    const acceptResp = await ctx.post(base + "/tasks/accept", headers, {
+      task_codes: pending.map((t) => t.task_code),
+    });
+    if (!is2xx(acceptResp.status)) parts.push("任务接领失败（HTTP " + acceptResp.status + "）");
+  }
+
+  // 2) 逐个领奖：只对 completed 的
+  for (const task of ready) {
+    const claimPath = base + "/tasks/" + encodeURIComponent(task.task_code) + "/claim";
+    const claimResp = await ctx.post(claimPath, headers);
+    if (!is2xx(claimResp.status)) {
+      parts.push("领任务奖「" + (task.title || task.task_code) + "」失败（HTTP " + claimResp.status + "）");
+      continue;
+    }
+    // 别的端已经领过：上游不再发奖，照实说，不把列表里的 reward_credit 算进来
+    if (dig(claimResp.body, "already_claimed") === true) {
+      parts.push("领任务奖「" + (task.title || task.task_code) + "」：上游报已领过");
+      continue;
+    }
+    // 积分与能量只认**领奖响应**：列表里的 reward_credit 只是"这个任务值多少"。
+    // digNum 用 Number() 归一：上游把数字给成字符串时，"0" + 100 会变成字符串拼接。
+    const credit = digNum(claimResp.body, "credit");
+    const energy = digNum(claimResp.body, "energy");
+    if (credit) ctx.credits += credit;
     // 只列出实际拿到的奖励项，与成长中心其它步骤的「+20 积分」文案风格一致
     const gains = [];
     if (credit) gains.push("+" + credit + " 积分");
