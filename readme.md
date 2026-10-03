@@ -1,5 +1,11 @@
 # WorkBuddy 每日签到 — Cloudflare Workers 版
 
+> **📦 已合并进三合一项目：[app-cf-checkin](https://github.com/chevy222/app-cf-checkin)**
+>
+> 本仓库是单工具的独立版本，功能已被新项目完整覆盖。新项目一个 Worker 同时支持 **Qoder / Trae / WorkBuddy / 69 云**，带可视化界面、访问口令、日志与原始请求查看、断点续跑不重复领取。
+>
+> 👉 新用户直接用新版：https://github.com/chevy222/app-cf-checkin
+
 **只有一个代码文件 `worker.js`，不需要安装 Node / npm / wrangler，在 Cloudflare 网页控制台粘贴即可。**
 
 - 每天定时自动签到 + 成长中心全套（领旅行礼物、派 Buddy 出发、抽奖、开盲盒、领任务奖、连签兑换）；
